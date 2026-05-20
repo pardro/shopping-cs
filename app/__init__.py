@@ -1,0 +1,1 @@
+"""Shopping CS service package."""
