@@ -24,8 +24,6 @@ class ChannelClient(ABC):
 
 class ApiChannelClient(ChannelClient):
     def __init__(self, base_url: str, timeout_seconds: float = 15.0):
-        if not base_url:
-            raise ValueError(f"{self.channel.value} API base URL is required")
         self._base_url = base_url.rstrip("/")
         self._timeout = httpx.Timeout(timeout_seconds)
 
@@ -38,6 +36,8 @@ class ApiChannelClient(ChannelClient):
         json: dict[str, Any] | None = None,
         params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        if not self._base_url:
+            raise ValueError(f"{self.channel.value} API base URL is required")
         async with httpx.AsyncClient(base_url=self._base_url, timeout=self._timeout) as client:
             response = await client.request(
                 method,

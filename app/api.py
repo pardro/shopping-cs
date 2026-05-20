@@ -13,6 +13,7 @@ router = APIRouter()
 
 class CommandRequest(BaseModel):
     text: str
+    user_key: str = "api"
 
 
 @router.get("/health")
@@ -25,7 +26,7 @@ async def command(
     request: CommandRequest,
     agent: MainAgent = Depends(get_main_agent),
 ) -> CommandResult:
-    return await agent.handle_command(request.text)
+    return await agent.handle_message(request.text, user_key=request.user_key)
 
 
 @router.post("/webhooks/kakao/cs")

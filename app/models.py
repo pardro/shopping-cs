@@ -40,6 +40,31 @@ class DraftReply(BaseModel):
     rationale: str
 
 
+class ActionType(StrEnum):
+    SYNC = "sync"
+    SUMMARY = "summary"
+    DRAFT_REPLY = "draft_reply"
+    SEND_REPLY = "send_reply"
+    CLOSE_TICKET = "close_ticket"
+
+
+class PlannedAction(BaseModel):
+    type: ActionType
+    channel: ChannelName | None = None
+    conversation_id: str | None = None
+    message: str | None = None
+    reason: str
+
+
+class ExecutionPlan(BaseModel):
+    user_goal: str
+    summary: str
+    actions: list[PlannedAction] = Field(default_factory=list)
+    needs_more_info: bool = False
+    question: str | None = None
+    risk_notes: list[str] = Field(default_factory=list)
+
+
 class ChannelSummary(BaseModel):
     channel: ChannelName
     open_count: int

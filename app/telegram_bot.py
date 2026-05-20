@@ -51,7 +51,7 @@ class TelegramBot:
         if not self._is_allowed(chat_id):
             await self._send_message(client, chat_id, "허용되지 않은 Telegram chat_id입니다.")
             return
-        result = await self._agent.handle_command(text)
+        result = await self._agent.handle_message(text, user_key=f"telegram:{chat_id}")
         await self._send_message(client, chat_id, result.message)
 
     async def _send_message(self, client: httpx.AsyncClient, chat_id: int, text: str) -> None:

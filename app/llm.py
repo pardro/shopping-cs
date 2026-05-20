@@ -1,4 +1,5 @@
 from openai import AsyncOpenAI
+from pydantic import BaseModel
 
 from app.config import Settings
 
@@ -20,3 +21,28 @@ class ChatGPTClient:
             ],
         )
         return response.choices[0].message.content or ""
+
+    async def complete_json(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        schema: type[BaseModel],
+    ) -> BaseModel:
+        schema_prompt = (
+            f"{system_prompt}\n\n"
+            "Return a single JSON object that validates against this JSON schema:\n"
+            f"{schema.model_json_schema()}"
+        )
+        response = await self._client.chat.completions.create(
+            model=self._settings.openai_model,
+            temperature=self._settings.openai_temperature,
+            messages=[
+                {"role": "system", "content": schema_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            response_format={"type": "json_object"},
+        )
+        content = response.choices[0].message.content
+        if not content:
+            raise ValueError("LLM did not return structured output")
+        return schema.model_validate_json(content)

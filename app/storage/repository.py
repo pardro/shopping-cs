@@ -1,7 +1,14 @@
 import sqlite3
 from pathlib import Path
 
-from app.models import ChannelName, ChannelSummary, Conversation, TicketStatus
+from app.models import (
+    ChannelName,
+    ChannelSummary,
+    Conversation,
+    ConversationMessage,
+    ExecutionPlan,
+    TicketStatus,
+)
 
 
 class CsRepository:
@@ -31,6 +38,15 @@ class CsRepository:
                     channel TEXT NOT NULL,
                     conversation_id TEXT NOT NULL,
                     text TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pending_plans (
+                    user_key TEXT PRIMARY KEY,
+                    plan_payload TEXT NOT NULL,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
                 """
@@ -139,6 +155,36 @@ class CsRepository:
                 (channel.value, conversation_id, text),
             )
 
+    def save_pending_plan(self, user_key: str, plan: ExecutionPlan) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO pending_plans (user_key, plan_payload, created_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(user_key) DO UPDATE SET
+                    plan_payload = excluded.plan_payload,
+                    created_at = CURRENT_TIMESTAMP
+                """,
+                (user_key, plan.model_dump_json()),
+            )
+
+    def get_pending_plan(self, user_key: str) -> ExecutionPlan | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT plan_payload FROM pending_plans
+                WHERE user_key = ?
+                """,
+                (user_key,),
+            ).fetchone()
+        if not row:
+            return None
+        return ExecutionPlan.model_validate_json(row["plan_payload"])
+
+    def clear_pending_plan(self, user_key: str) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM pending_plans WHERE user_key = ?", (user_key,))
+
     def ingest_webhook(self, channel: ChannelName, payload: dict) -> Conversation:
         conversation_id = str(
             payload.get("conversation_id")
@@ -152,11 +198,30 @@ class CsRepository:
         existing = self.get_conversation(channel, conversation_id)
         merged_payload = existing.raw if existing else {}
         merged_payload.update(payload)
+        messages = existing.messages if existing else []
+        message_text = payload.get("text") or payload.get("content") or payload.get("message")
+        if message_text:
+            message_id = str(
+                payload.get("message_id")
+                or payload.get("messageId")
+                or payload.get("event_id")
+                or f"{conversation_id}-{len(messages) + 1}"
+            )
+            if all(message.message_id != message_id for message in messages):
+                messages.append(
+                    ConversationMessage(
+                        message_id=message_id,
+                        sender=str(payload.get("sender") or payload.get("from") or "customer"),
+                        text=str(message_text),
+                        raw=payload,
+                    )
+                )
         conversation = Conversation(
             channel=channel,
             conversation_id=conversation_id,
             customer_name=payload.get("customer_name") or payload.get("customerName"),
             status=TicketStatus.OPEN,
+            messages=messages,
             raw=merged_payload,
         )
         self.upsert_conversation(conversation)

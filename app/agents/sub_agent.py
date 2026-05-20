@@ -56,7 +56,8 @@ class ChannelCsAgent:
         conversation = self._repository.get_conversation(self.channel, conversation_id)
         if not conversation:
             raise ValueError(
-                f"{self.channel.value} conversation '{conversation_id}' was not found. Run /sync first."
+                f"{self.channel.value} conversation '{conversation_id}' was not found. "
+                "먼저 채널 동기화를 요청하고 승인해주세요."
             )
         return conversation
 

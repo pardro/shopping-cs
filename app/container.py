@@ -29,4 +29,5 @@ def get_main_agent() -> MainAgent:
             ChannelName.NAVER: naver_agent,
         },
         repository=repository,
+        llm=llm,
     )
