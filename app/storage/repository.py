@@ -1,3 +1,4 @@
+import json
 import sqlite3
 from pathlib import Path
 
@@ -48,6 +49,15 @@ class CsRepository:
                     user_key TEXT PRIMARY KEY,
                     plan_payload TEXT NOT NULL,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_contexts (
+                    user_key TEXT PRIMARY KEY,
+                    context_payload TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
                 """
             )
@@ -184,6 +194,32 @@ class CsRepository:
     def clear_pending_plan(self, user_key: str) -> None:
         with self._connect() as conn:
             conn.execute("DELETE FROM pending_plans WHERE user_key = ?", (user_key,))
+
+    def save_user_context(self, user_key: str, context: dict) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO user_contexts (user_key, context_payload, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(user_key) DO UPDATE SET
+                    context_payload = excluded.context_payload,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (user_key, json.dumps(context, ensure_ascii=False)),
+            )
+
+    def get_user_context(self, user_key: str) -> dict:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT context_payload FROM user_contexts
+                WHERE user_key = ?
+                """,
+                (user_key,),
+            ).fetchone()
+        if not row:
+            return {}
+        return json.loads(row["context_payload"])
 
     def ingest_webhook(self, channel: ChannelName, payload: dict) -> Conversation:
         conversation_id = str(

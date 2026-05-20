@@ -54,6 +54,7 @@ class PlannedAction(BaseModel):
     conversation_id: str | None = None
     message: str | None = None
     reason: str
+    prepared_api: str | None = None
 
 
 class ExecutionPlan(BaseModel):

@@ -17,9 +17,10 @@ class ChannelCsAgent:
             self._repository.upsert_conversation(conversation)
         return len(conversations)
 
-    async def draft_reply(self, conversation_id: str) -> DraftReply:
+    async def draft_reply(self, conversation_id: str, guidance: str | None = None) -> DraftReply:
         conversation = self._load_conversation(conversation_id)
         latest_context = self._format_conversation(conversation)
+        guidance_text = guidance or "별도 지시 없음"
         system_prompt = (
             "You are a Korean customer support agent for an online store. "
             "Write concise, polite, action-oriented Korean replies. "
@@ -31,6 +32,7 @@ class ChannelCsAgent:
             f"고객명: {conversation.customer_name or '미확인'}\n"
             f"대화 ID: {conversation.conversation_id}\n\n"
             f"대화 내용:\n{latest_context}\n\n"
+            f"운영자가 원하는 답변 방향 또는 포함 문구:\n{guidance_text}\n\n"
             "고객에게 보낼 답변 초안을 작성하고, 마지막 줄에 '근거:'로 짧은 판단 근거를 써주세요."
         )
         raw_reply = await self._llm.complete(system_prompt, user_prompt)

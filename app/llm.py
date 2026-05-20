@@ -1,3 +1,5 @@
+import json
+
 from openai import AsyncOpenAI
 from pydantic import BaseModel
 
@@ -31,7 +33,7 @@ class ChatGPTClient:
         schema_prompt = (
             f"{system_prompt}\n\n"
             "Return a single JSON object that validates against this JSON schema:\n"
-            f"{schema.model_json_schema()}"
+            f"{json.dumps(schema.model_json_schema(), ensure_ascii=False)}"
         )
         response = await self._client.chat.completions.create(
             model=self._settings.openai_model,

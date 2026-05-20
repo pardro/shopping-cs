@@ -44,7 +44,8 @@ class MainAgent:
             return await self._execute_pending_plan(user_key)
 
         try:
-            plan = await self._create_plan(normalized)
+            plan = await self._create_plan(normalized, user_key)
+            plan = self._prepare_plan(plan, user_key)
         except Exception as exc:
             return CommandResult(ok=False, message=f"요청 분석 실패: {exc}")
 
@@ -76,10 +77,10 @@ class MainAgent:
             ]
         )
 
-    async def _create_plan(self, user_request: str) -> ExecutionPlan:
+    async def _create_plan(self, user_request: str, user_key: str) -> ExecutionPlan:
         parsed = await self._llm.complete_json(
             system_prompt=self._planner_system_prompt(),
-            user_prompt=self._planner_user_prompt(user_request),
+            user_prompt=self._planner_user_prompt(user_request, user_key),
             schema=ExecutionPlan,
         )
         if not isinstance(parsed, ExecutionPlan):
@@ -98,11 +99,15 @@ class MainAgent:
         ok = True
         for index, action in enumerate(plan.actions, start=1):
             try:
-                result = await self._execute_action(action)
+                result = await self._execute_action(action, user_key)
                 results.append(f"{index}. 완료 - {result}")
             except Exception as exc:
                 ok = False
                 results.append(f"{index}. 실패 - {self._describe_action(action)}: {exc}")
+                remaining = len(plan.actions) - index
+                if remaining:
+                    results.append(f"남은 {remaining}개 작업은 실행하지 않았습니다.")
+                break
 
         self._repository.clear_pending_plan(user_key)
         prefix = "실행 결과" if ok else "일부 작업이 실패했습니다"
@@ -112,7 +117,7 @@ class MainAgent:
             data={"plan": plan.model_dump(), "results": results},
         )
 
-    async def _execute_action(self, action: PlannedAction) -> str:
+    async def _execute_action(self, action: PlannedAction, user_key: str) -> str:
         if action.type == ActionType.SYNC:
             synced: dict[str, int] = {}
             targets = [action.channel] if action.channel else list(self._sub_agents.keys())
@@ -123,14 +128,14 @@ class MainAgent:
             return ", ".join(f"{channel} {count}건 동기화" for channel, count in synced.items())
 
         if action.type == ActionType.SUMMARY:
-            return self._summary_text()
+            return self._summary_text(user_key=user_key)
 
         channel = self._require_channel(action)
         conversation_id = self._require_conversation_id(action)
         agent = self._sub_agents[channel]
 
         if action.type == ActionType.DRAFT_REPLY:
-            draft = await agent.draft_reply(conversation_id)
+            draft = await agent.draft_reply(conversation_id, guidance=action.message)
             return f"{channel.value} #{conversation_id} 답변 초안:\n{draft.reply}\n근거: {draft.rationale}"
 
         if action.type == ActionType.SEND_REPLY:
@@ -145,7 +150,7 @@ class MainAgent:
 
         raise ValueError(f"지원하지 않는 액션입니다: {action.type}")
 
-    def _summary_text(self) -> str:
+    def _summary_text(self, user_key: str | None = None) -> str:
         summaries = self._repository.summarize()
         lines = ["채널별 CS 현황"]
         for summary in summaries:
@@ -153,13 +158,25 @@ class MainAgent:
                 f"- {summary.channel.value}: open {summary.open_count}, "
                 f"pending {summary.pending_count}, closed {summary.closed_count}"
             )
-        open_tickets = self._repository.list_conversations(status=TicketStatus.OPEN, limit=10)
+        open_tickets = self._repository.list_conversations(status=TicketStatus.OPEN, limit=50)
+        mapping: dict[str, dict[str, str]] = {channel.value: {} for channel in ChannelName}
         if open_tickets:
-            lines.append("\n최근 open 티켓")
-            lines.extend(
-                f"- {ticket.channel.value} #{ticket.conversation_id} "
-                f"{ticket.customer_name or ''}".rstrip()
-                for ticket in open_tickets
+            lines.append("\n미처리 문의 목록")
+            for channel in ChannelName:
+                channel_tickets = [ticket for ticket in open_tickets if ticket.channel == channel]
+                if not channel_tickets:
+                    continue
+                lines.append(f"\n{channel.value}")
+                for index, ticket in enumerate(channel_tickets, start=1):
+                    mapping[channel.value][str(index)] = ticket.conversation_id
+                    lines.append(f"{index}. {self._ticket_line(ticket)}")
+        if user_key:
+            self._repository.save_user_context(
+                user_key,
+                {
+                    "last_open_ticket_mapping": mapping,
+                    "last_open_ticket_text": "\n".join(lines),
+                },
             )
         return "\n".join(lines)
 
@@ -174,6 +191,7 @@ class MainAgent:
         for index, action in enumerate(plan.actions, start=1):
             lines.append(f"{index}. {self._describe_action(action)}")
             lines.append(f"   이유: {action.reason}")
+            lines.append(f"   준비된 API 작업: {action.prepared_api or self._prepared_api_text(action)}")
         if plan.risk_notes:
             lines.append("")
             lines.append("주의 사항:")
@@ -198,13 +216,16 @@ class MainAgent:
             return f"{channel}{target} 상담 종료"
         return str(action.type)
 
-    def _planner_user_prompt(self, user_request: str) -> str:
+    def _planner_user_prompt(self, user_request: str, user_key: str) -> str:
         return "\n".join(
             [
                 f"사용자 요청: {user_request}",
                 "",
                 "현재 CS 상태:",
                 self._summary_text(),
+                "",
+                "직전에 사용자에게 보여준 문의 번호표:",
+                self._last_ticket_mapping_text(user_key),
                 "",
                 "최근 open 티켓:",
                 self._recent_open_ticket_text(),
@@ -219,12 +240,65 @@ class MainAgent:
             "Do not execute anything. Return only structured data matching the schema. "
             "Available actions are: sync, summary, draft_reply, send_reply, close_ticket. "
             "Use channel values only when known: kakao or naver. "
+            "If the user asks to list unresolved/open inquiries by channel, use summary. "
+            "If the user asks to sync and then list or summarize, create sync first and summary second. "
+            "If the user says '초안', use draft_reply, not send_reply. "
+            "If the user says '보내줘' or clearly asks to send to the customer, use send_reply. "
+            "If the user references a numbered inquiry such as '카카오 1번', resolve it using the provided ticket mapping. "
             "For send_reply and close_ticket, channel and conversation_id are required. "
+            "For draft_reply, put any requested answer direction or quoted content in message. "
             "For send_reply, message is required and must be exactly what should be sent to the customer. "
             "If required information is missing, set needs_more_info=true and ask a concise Korean question. "
             "For risky customer-facing actions, add a risk note. "
             "The user will approve the plan later, so never mark actions as already done."
         )
+
+    def _prepare_plan(self, plan: ExecutionPlan, user_key: str) -> ExecutionPlan:
+        for action in plan.actions:
+            action.conversation_id = self._resolve_numbered_reference(action, user_key)
+            action.prepared_api = self._prepared_api_text(action)
+        return plan
+
+    def _resolve_numbered_reference(self, action: PlannedAction, user_key: str) -> str | None:
+        conversation_id = action.conversation_id
+        if not action.channel or not conversation_id:
+            return conversation_id
+        number = conversation_id.strip().replace("번", "")
+        if not number.isdigit():
+            return conversation_id
+        context = self._repository.get_user_context(user_key)
+        mapping = context.get("last_open_ticket_mapping", {})
+        channel_mapping = mapping.get(action.channel.value, {})
+        return channel_mapping.get(number, conversation_id)
+
+    @staticmethod
+    def _prepared_api_text(action: PlannedAction) -> str:
+        channel = action.channel.value if action.channel else "kakao/naver"
+        conversation_id = action.conversation_id or "{conversation_id}"
+        if action.type == ActionType.SYNC:
+            return f"GET {channel} 대화 목록 API"
+        if action.type == ActionType.SUMMARY:
+            return "로컬 DB 미처리 문의 조회"
+        if action.type == ActionType.DRAFT_REPLY:
+            return f"OpenAI ChatGPT 답변 초안 생성, 대상 {channel} #{conversation_id}"
+        if action.type == ActionType.SEND_REPLY:
+            return f"POST {channel} 메시지 전송 API, 대상 #{conversation_id}"
+        if action.type == ActionType.CLOSE_TICKET:
+            return f"PATCH {channel} 상담 상태 변경 API, 대상 #{conversation_id}"
+        return "지원하지 않는 API 작업"
+
+    def _last_ticket_mapping_text(self, user_key: str) -> str:
+        context = self._repository.get_user_context(user_key)
+        mapping = context.get("last_open_ticket_mapping", {})
+        if not mapping:
+            return "저장된 번호표 없음"
+        lines: list[str] = []
+        for channel, items in mapping.items():
+            if not items:
+                continue
+            pairs = ", ".join(f"{number}번 -> {conversation_id}" for number, conversation_id in items.items())
+            lines.append(f"{channel}: {pairs}")
+        return "\n".join(lines) if lines else "저장된 번호표 없음"
 
     def _recent_open_ticket_text(self) -> str:
         tickets = self._repository.list_conversations(status=TicketStatus.OPEN, limit=10)
@@ -234,6 +308,18 @@ class MainAgent:
             f"- {ticket.channel.value} #{ticket.conversation_id} {ticket.customer_name or ''}".rstrip()
             for ticket in tickets
         )
+
+    @staticmethod
+    def _ticket_line(ticket) -> str:
+        latest_message = ""
+        if ticket.messages:
+            latest_message = ticket.messages[-1].text[:80]
+        parts = [f"#{ticket.conversation_id}"]
+        if ticket.customer_name:
+            parts.append(ticket.customer_name)
+        if latest_message:
+            parts.append(f"- {latest_message}")
+        return " ".join(parts)
 
     @staticmethod
     def _require_channel(action: PlannedAction) -> ChannelName:
