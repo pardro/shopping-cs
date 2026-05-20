@@ -39,6 +39,216 @@ python -m app.telegram_bot
 
 `channel` 값은 `kakao` 또는 `naver`를 사용합니다.
 
+## 서비스 실행 예시
+
+### 1. 최초 준비
+
+프로젝트 최상단에서 실행합니다.
+
+```bash
+cp .env.example .env
+```
+
+`.env`에 OpenAI, Telegram, Kakao, Naver 키와 API URL을 채웁니다. 로컬에서 구조만 확인하려면
+최소한 `OPENAI_API_KEY`, `TELEGRAM_BOT_TOKEN`을 먼저 채우고 시작하세요. `/sync`, `/send`,
+`/close`는 실제 카카오/네이버 API 설정이 끝나야 동작합니다.
+
+의존성을 설치합니다.
+
+```bash
+pip install -e .
+```
+
+### 2. API 서버 실행
+
+터미널 1에서 FastAPI 서버를 실행합니다.
+
+```bash
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+정상 실행 확인:
+
+```bash
+curl http://localhost:8000/health
+```
+
+예상 응답:
+
+```json
+{"status":"ok"}
+```
+
+### 3. Telegram 워커 실행
+
+터미널 2에서 Telegram long polling 워커를 실행합니다.
+
+```bash
+python -m app.telegram_bot
+```
+
+이 프로세스가 켜져 있어야 Telegram에서 보낸 명령을 메인 에이전트가 처리합니다.
+
+### 4. HTTP API로 명령 테스트
+
+Telegram을 연결하기 전에도 `/commands` 엔드포인트로 메인 에이전트를 테스트할 수 있습니다.
+
+도움말:
+
+```bash
+curl -X POST http://localhost:8000/commands \
+  -H "Content-Type: application/json" \
+  -d '{"text":"/help"}'
+```
+
+채널별 현황:
+
+```bash
+curl -X POST http://localhost:8000/commands \
+  -H "Content-Type: application/json" \
+  -d '{"text":"/summary"}'
+```
+
+전체 채널 동기화:
+
+```bash
+curl -X POST http://localhost:8000/commands \
+  -H "Content-Type: application/json" \
+  -d '{"text":"/sync"}'
+```
+
+카카오 대화 답변 초안 생성:
+
+```bash
+curl -X POST http://localhost:8000/commands \
+  -H "Content-Type: application/json" \
+  -d '{"text":"/draft kakao KAKAO_CONVERSATION_ID"}'
+```
+
+네이버 대화 답변 초안 생성:
+
+```bash
+curl -X POST http://localhost:8000/commands \
+  -H "Content-Type: application/json" \
+  -d '{"text":"/draft naver NAVER_CONVERSATION_ID"}'
+```
+
+카카오 고객에게 답변 전송:
+
+```bash
+curl -X POST http://localhost:8000/commands \
+  -H "Content-Type: application/json" \
+  -d '{"text":"/send kakao KAKAO_CONVERSATION_ID 안녕하세요. 문의주신 주문 건 확인 후 안내드리겠습니다."}'
+```
+
+네이버 톡톡 고객에게 답변 전송:
+
+```bash
+curl -X POST http://localhost:8000/commands \
+  -H "Content-Type: application/json" \
+  -d '{"text":"/send naver NAVER_CONVERSATION_ID 안녕하세요. 배송 상태 확인 후 바로 안내드리겠습니다."}'
+```
+
+대화 종료:
+
+```bash
+curl -X POST http://localhost:8000/commands \
+  -H "Content-Type: application/json" \
+  -d '{"text":"/close kakao KAKAO_CONVERSATION_ID"}'
+```
+
+### 5. Telegram에서 명령하기
+
+Telegram 앱에서 BotFather로 만든 봇에게 아래처럼 메시지를 보냅니다.
+
+도움말:
+
+```text
+/help
+```
+
+CS 현황 확인:
+
+```text
+/summary
+```
+
+카카오/네이버 최신 대화 동기화:
+
+```text
+/sync
+```
+
+카카오 대화 답변 초안:
+
+```text
+/draft kakao KAKAO_CONVERSATION_ID
+```
+
+네이버 대화 답변 초안:
+
+```text
+/draft naver NAVER_CONVERSATION_ID
+```
+
+카카오 고객에게 직접 답변:
+
+```text
+/send kakao KAKAO_CONVERSATION_ID 안녕하세요. 확인 후 빠르게 안내드리겠습니다.
+```
+
+네이버 톡톡 고객에게 직접 답변:
+
+```text
+/send naver NAVER_CONVERSATION_ID 안녕하세요. 문의주신 내용 확인했습니다.
+```
+
+상담 종료:
+
+```text
+/close naver NAVER_CONVERSATION_ID
+```
+
+### 6. 채널 웹훅 테스트
+
+실제 카카오/네이버 웹훅을 연결하기 전, 로컬에서 웹훅 저장 흐름을 테스트할 수 있습니다.
+
+카카오 웹훅 예시:
+
+```bash
+curl -X POST http://localhost:8000/webhooks/kakao/cs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "conversation_id": "kakao-test-001",
+    "customer_name": "홍길동",
+    "message": "배송은 언제 출발하나요?"
+  }'
+```
+
+네이버 웹훅 예시:
+
+```bash
+curl -X POST http://localhost:8000/webhooks/naver/cs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "conversation_id": "naver-test-001",
+    "customer_name": "김고객",
+    "message": "교환 접수 가능한가요?"
+  }'
+```
+
+저장 후 Telegram 또는 HTTP API에서 `/summary`를 실행하면 open 티켓으로 표시됩니다.
+
+### 7. 일반 운영 흐름
+
+1. `uvicorn app.main:app --host 0.0.0.0 --port 8000`으로 API 서버를 켭니다.
+2. `python -m app.telegram_bot`으로 Telegram 워커를 켭니다.
+3. Telegram에서 `/sync`로 카카오/네이버 대화를 가져옵니다.
+4. `/summary`로 처리할 티켓을 확인합니다.
+5. `/draft kakao <conversation_id>` 또는 `/draft naver <conversation_id>`로 ChatGPT 답변 초안을 받습니다.
+6. 초안을 검토한 뒤 `/send ...`로 고객에게 전송합니다.
+7. 상담이 끝나면 `/close ...`로 종료 처리합니다.
+
 ## API 키 발급 및 환경 변수 설정
 
 모든 키와 실행 파라미터는 프로젝트 최상단의 `.env`에서만 관리합니다. 실제 운영 키는
