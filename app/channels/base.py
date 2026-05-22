@@ -62,16 +62,55 @@ def normalize_conversation(
     conversation_id = first_present(item, id_keys)
     messages_payload = first_present(item, messages_keys, default=[])
     status_value = item.get("status") or item.get("state") or TicketStatus.OPEN
-    messages = [
-        ConversationMessage(
-            message_id=str(first_present(message, ("message_id", "messageId", "id"), default="")),
-            sender=str(message.get("sender") or message.get("from") or "customer"),
-            text=str(message.get("text") or message.get("content") or message.get("message") or ""),
-            raw=message,
+    messages = []
+    if isinstance(messages_payload, str):
+        messages_payload = [{"text": messages_payload}]
+    if isinstance(messages_payload, dict):
+        messages_payload = [messages_payload]
+    for index, message in enumerate(messages_payload, start=1):
+        if not isinstance(message, dict):
+            continue
+        text = first_present(
+            message,
+            ("text", "content", "message", "inquiryContent", "answerContent", "contents"),
+            default="",
         )
-        for message in messages_payload
-        if isinstance(message, dict)
-    ]
+        if not text:
+            continue
+        messages.append(
+            ConversationMessage(
+                message_id=str(
+                    first_present(
+                        message,
+                        ("message_id", "messageId", "id", "inquiryNo", "answerNo"),
+                        default=f"{conversation_id}-{index}",
+                    )
+                ),
+                sender=str(
+                    message.get("sender")
+                    or message.get("from")
+                    or message.get("writer")
+                    or "customer"
+                ),
+                text=str(text),
+                raw=message,
+            )
+        )
+    if not messages:
+        fallback_text = first_present(
+            item,
+            ("text", "content", "message", "inquiryContent", "question", "title"),
+            default="",
+        )
+        if fallback_text:
+            messages.append(
+                ConversationMessage(
+                    message_id=str(conversation_id),
+                    sender=str(item.get("sender") or item.get("from") or "customer"),
+                    text=str(fallback_text),
+                    raw=item,
+                )
+            )
     return Conversation(
         channel=channel,
         conversation_id=str(conversation_id),

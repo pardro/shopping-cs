@@ -100,7 +100,7 @@ class NaverTalkTalkClient(ApiChannelClient):
                 channel=self.channel,
                 item=item,
                 id_keys=("inquiryNo", "inquiry_no", "conversation_id", "conversationId", "id"),
-                messages_keys=("messages", "contents", "inquiryContents"),
+                messages_keys=("messages", "inquiryContents", "answers"),
             )
             for item in items
             if isinstance(item, dict)

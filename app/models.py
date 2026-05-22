@@ -43,6 +43,7 @@ class DraftReply(BaseModel):
 class ActionType(StrEnum):
     SYNC = "sync"
     SUMMARY = "summary"
+    CONVERSATION_DETAIL = "conversation_detail"
     DRAFT_REPLY = "draft_reply"
     SEND_REPLY = "send_reply"
     CLOSE_TICKET = "close_ticket"

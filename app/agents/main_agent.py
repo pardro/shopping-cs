@@ -1,5 +1,6 @@
 from collections.abc import Mapping
 
+from app.agents.draft_reply_agent import DraftReplyAgent
 from app.agents.sub_agent import ChannelCsAgent
 from app.audit import AuditLogger
 from app.llm import ChatGPTClient
@@ -57,6 +58,8 @@ class MainAgent:
         try:
             plan = await self._create_plan(normalized, user_key)
             plan = self._prepare_plan(plan, user_key)
+            plan = self._optimize_plan_for_fresh_context(plan)
+            plan = self._append_contextual_close_if_needed(plan, user_key)
         except Exception as exc:
             return CommandResult(ok=False, message=f"요청 분석 실패: {exc}")
 
@@ -115,8 +118,9 @@ class MainAgent:
                 "흐름:",
                 "1. 조회, 동기화, 초안, 상담 종료는 바로 실행합니다.",
                 "2. 고객에게 특정 메시지를 전송하는 작업만 먼저 승인 요청을 드립니다.",
-                "3. 전송 계획이 맞으면 '승인' 또는 '실행'이라고 답장하세요.",
-                "4. 취소하려면 '취소'라고 답장하세요.",
+                "3. 직전 상담과 다른 맥락의 요청을 하면 직전 상담은 자동 종료합니다.",
+                "4. 전송 계획이 맞으면 '승인' 또는 '실행'이라고 답장하세요.",
+                "5. 취소하려면 '취소'라고 답장하세요.",
             ]
         )
 
@@ -200,18 +204,44 @@ class MainAgent:
         conversation_id = self._require_conversation_id(action)
         agent = self._sub_agents[channel]
 
+        if action.type == ActionType.CONVERSATION_DETAIL:
+            conversation = self._repository.get_conversation(channel, conversation_id)
+            if not conversation:
+                raise ValueError(
+                    f"{channel.value} conversation '{conversation_id}' was not found. "
+                    "먼저 채널 동기화를 요청해주세요."
+                )
+            self._set_active_conversation(user_key, channel, conversation_id)
+            history = DraftReplyAgent.format_conversation_history(conversation)
+            return f"{channel.value} #{conversation_id} 이전 대화 기록\n{history}"
+
         if action.type == ActionType.DRAFT_REPLY:
+            conversation = self._repository.get_conversation(channel, conversation_id)
+            if not conversation:
+                raise ValueError(
+                    f"{channel.value} conversation '{conversation_id}' was not found. "
+                    "먼저 채널 동기화를 요청해주세요."
+                )
             draft = await agent.draft_reply(conversation_id, guidance=action.message)
-            return f"{channel.value} #{conversation_id} 답변 초안:\n{draft.reply}\n근거: {draft.rationale}"
+            self._set_active_conversation(user_key, channel, conversation_id)
+            history = DraftReplyAgent.format_conversation_history(conversation)
+            return (
+                f"{channel.value} #{conversation_id} 이전 대화 기록\n"
+                f"{history}\n\n"
+                f"답변 초안:\n{draft.reply}\n"
+                f"근거: {draft.rationale}"
+            )
 
         if action.type == ActionType.SEND_REPLY:
             if not action.message:
                 raise ValueError("전송할 메시지가 없습니다")
             await agent.send_reply(conversation_id, action.message)
+            self._set_active_conversation(user_key, channel, conversation_id)
             return f"{channel.value} #{conversation_id} 답변 전송"
 
         if action.type == ActionType.CLOSE_TICKET:
             await agent.close(conversation_id)
+            self._clear_active_conversation(user_key, channel, conversation_id)
             return f"{channel.value} #{conversation_id} 상담 종료"
 
         raise ValueError(f"지원하지 않는 액션입니다: {action.type}")
@@ -237,7 +267,7 @@ class MainAgent:
                     mapping[channel.value][str(index)] = ticket.conversation_id
                     lines.append(f"{index}. {self._ticket_line(ticket)}")
         if user_key:
-            self._repository.save_user_context(
+            self._update_user_context(
                 user_key,
                 {
                     "last_open_ticket_mapping": mapping,
@@ -274,6 +304,8 @@ class MainAgent:
             return f"{channel} 대화 동기화"
         if action.type == ActionType.SUMMARY:
             return "CS 현황 요약"
+        if action.type == ActionType.CONVERSATION_DETAIL:
+            return f"{channel}{target} 이전 대화 기록 조회"
         if action.type == ActionType.DRAFT_REPLY:
             return f"{channel}{target} 답변 초안 생성"
         if action.type == ActionType.SEND_REPLY:
@@ -304,9 +336,14 @@ class MainAgent:
             "You are a Korean shopping mall CS assistant planner. "
             "Analyze the user's natural language request and create a safe execution plan. "
             "Do not execute anything. Return only structured data matching the schema. "
-            "Available actions are: sync, summary, draft_reply, send_reply, close_ticket. "
+            "Available actions are: sync, summary, conversation_detail, draft_reply, "
+            "send_reply, close_ticket. "
             "Use channel values only when known: kakao or naver. "
+            "Prefer freshness over minimizing API calls. It is acceptable to sync before "
+            "reading, summarizing, or drafting from conversations. "
             "If the user asks to list unresolved/open inquiries by channel, use summary. "
+            "If the user asks about the details, context, or previous conversation of a "
+            "specific inquiry without asking for a reply draft, use conversation_detail. "
             "If the user asks to sync and then list or summarize, create sync first and summary second. "
             "If the user says '초안', use draft_reply, not send_reply. "
             "If the user says '보내줘' or clearly asks to send to the customer, use send_reply. "
@@ -325,6 +362,86 @@ class MainAgent:
             action.conversation_id = self._resolve_numbered_reference(action, user_key)
             action.prepared_api = self._prepared_api_text(action)
         return plan
+
+    def _optimize_plan_for_fresh_context(self, plan: ExecutionPlan) -> ExecutionPlan:
+        optimized_actions: list[PlannedAction] = []
+        synced_channels: set[ChannelName] = set()
+        synced_all = False
+
+        for action in plan.actions:
+            if action.type == ActionType.SYNC:
+                optimized_actions.append(action)
+                if action.channel:
+                    synced_channels.add(action.channel)
+                else:
+                    synced_all = True
+                continue
+
+            sync_action = self._sync_action_needed(action, synced_channels, synced_all)
+            if sync_action:
+                optimized_actions.append(sync_action)
+                if sync_action.channel:
+                    synced_channels.add(sync_action.channel)
+                else:
+                    synced_all = True
+
+            optimized_actions.append(action)
+
+        if optimized_actions == plan.actions:
+            return plan
+        for action in optimized_actions:
+            action.prepared_api = self._prepared_api_text(action)
+        return plan.model_copy(update={"actions": optimized_actions})
+
+    @staticmethod
+    def _sync_action_needed(
+        action: PlannedAction,
+        synced_channels: set[ChannelName],
+        synced_all: bool,
+    ) -> PlannedAction | None:
+        if action.type == ActionType.SUMMARY:
+            if synced_all:
+                return None
+            return PlannedAction(
+                type=ActionType.SYNC,
+                reason="최신 문의 목록을 기준으로 요약하기 위해 먼저 모든 채널을 동기화합니다.",
+                prepared_api="GET kakao/naver 대화 목록 API",
+            )
+
+        if action.type in {ActionType.CONVERSATION_DETAIL, ActionType.DRAFT_REPLY}:
+            if not action.channel or synced_all or action.channel in synced_channels:
+                return None
+            return PlannedAction(
+                type=ActionType.SYNC,
+                channel=action.channel,
+                reason="최신 전체 대화 기록을 기준으로 처리하기 위해 해당 채널을 먼저 동기화합니다.",
+                prepared_api=f"GET {action.channel.value} 대화 목록 API",
+            )
+
+        return None
+
+    def _append_contextual_close_if_needed(
+        self,
+        plan: ExecutionPlan,
+        user_key: str,
+    ) -> ExecutionPlan:
+        active = self._active_conversation(user_key)
+        if not active:
+            return plan
+        active_channel, active_conversation_id = active
+        if any(
+            action.channel == active_channel and action.conversation_id == active_conversation_id
+            for action in plan.actions
+        ):
+            return plan
+        close_action = PlannedAction(
+            type=ActionType.CLOSE_TICKET,
+            channel=active_channel,
+            conversation_id=active_conversation_id,
+            reason="새 요청이 직전에 다루던 상담 맥락이 아니므로 이전 상담을 자동 종료합니다.",
+            prepared_api="맥락 전환 감지에 따른 상담 종료 API 호출",
+        )
+        return plan.model_copy(update={"actions": [*plan.actions, close_action]})
 
     @staticmethod
     def _split_plan_by_approval_requirement(
@@ -360,8 +477,13 @@ class MainAgent:
             return f"GET {channel} 대화 목록 API"
         if action.type == ActionType.SUMMARY:
             return "로컬 DB 미처리 문의 조회"
+        if action.type == ActionType.CONVERSATION_DETAIL:
+            return f"로컬 DB 전체 이전 대화 기록 조회, 대상 {channel} #{conversation_id}"
         if action.type == ActionType.DRAFT_REPLY:
-            return f"OpenAI ChatGPT 답변 초안 생성, 대상 {channel} #{conversation_id}"
+            return (
+                "로컬 DB 전체 이전 대화 기록 조회 후 "
+                f"OpenAI ChatGPT 답변 초안 생성, 대상 {channel} #{conversation_id}"
+            )
         if action.type == ActionType.SEND_REPLY:
             return f"POST {channel} 메시지 전송 API, 대상 #{conversation_id}"
         if action.type == ActionType.CLOSE_TICKET:
@@ -401,6 +523,56 @@ class MainAgent:
         if latest_message:
             parts.append(f"- {latest_message}")
         return " ".join(parts)
+
+    def _active_conversation(self, user_key: str) -> tuple[ChannelName, str] | None:
+        context = self._repository.get_user_context(user_key)
+        active = context.get("active_conversation")
+        if not isinstance(active, dict):
+            return None
+        channel_value = active.get("channel")
+        conversation_id = active.get("conversation_id")
+        if not channel_value or not conversation_id:
+            return None
+        try:
+            channel = ChannelName(channel_value)
+        except ValueError:
+            return None
+        return channel, str(conversation_id)
+
+    def _set_active_conversation(
+        self,
+        user_key: str,
+        channel: ChannelName,
+        conversation_id: str,
+    ) -> None:
+        self._update_user_context(
+            user_key,
+            {
+                "active_conversation": {
+                    "channel": channel.value,
+                    "conversation_id": conversation_id,
+                }
+            },
+        )
+
+    def _clear_active_conversation(
+        self,
+        user_key: str,
+        channel: ChannelName,
+        conversation_id: str,
+    ) -> None:
+        active = self._active_conversation(user_key)
+        if not active:
+            return
+        active_channel, active_conversation_id = active
+        if active_channel != channel or active_conversation_id != conversation_id:
+            return
+        self._update_user_context(user_key, {"active_conversation": None})
+
+    def _update_user_context(self, user_key: str, updates: dict) -> None:
+        context = self._repository.get_user_context(user_key)
+        context.update(updates)
+        self._repository.save_user_context(user_key, context)
 
     @staticmethod
     def _require_channel(action: PlannedAction) -> ChannelName:

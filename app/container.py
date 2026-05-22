@@ -1,6 +1,6 @@
 from functools import lru_cache
 
-from app.agents import ChannelCsAgent, MainAgent
+from app.agents import ChannelCsAgent, DraftReplyAgent, MainAgent
 from app.audit import AuditLogger
 from app.channels import KakaoBizCenterClient, NaverTalkTalkClient
 from app.config import get_settings
@@ -23,8 +23,9 @@ def get_main_agent() -> MainAgent:
     repository = get_repository()
     llm = ChatGPTClient(settings)
     audit_logger = AuditLogger(settings.audit_log_dir)
-    kakao_agent = ChannelCsAgent(KakaoBizCenterClient(settings), llm, repository)
-    naver_agent = ChannelCsAgent(NaverTalkTalkClient(settings), llm, repository)
+    draft_reply_agent = DraftReplyAgent(llm)
+    kakao_agent = ChannelCsAgent(KakaoBizCenterClient(settings), draft_reply_agent, repository)
+    naver_agent = ChannelCsAgent(NaverTalkTalkClient(settings), draft_reply_agent, repository)
     return MainAgent(
         sub_agents={
             ChannelName.KAKAO: kakao_agent,
