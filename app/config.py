@@ -62,6 +62,7 @@ class Settings(BaseSettings):
         alias="NAVER_LIST_CONVERSATIONS_PATH",
     )
     naver_inquiry_search_days: int = Field(default=30, alias="NAVER_INQUIRY_SEARCH_DAYS")
+    naver_inquiry_page_size: int = Field(default=50, alias="NAVER_INQUIRY_PAGE_SIZE")
     naver_order_detail_path: str = Field(
         default="/v1/pay-order/seller/product-orders/query",
         alias="NAVER_ORDER_DETAIL_PATH",

@@ -50,9 +50,15 @@ class ApiChannelClient(ChannelClient):
                 response.raise_for_status()
             except httpx.HTTPStatusError as exc:
                 response_text = exc.response.text[:1000]
+                trace_id = (
+                    exc.response.headers.get("GNCP-GW-Trace-ID")
+                    or exc.response.headers.get("gncp-gw-trace-id")
+                )
+                trace_message = f"; trace_id={trace_id}" if trace_id else ""
                 raise ValueError(
                     f"{exc.response.status_code} {exc.response.reason_phrase} for "
-                    f"{exc.request.method} {exc.request.url}; response={response_text}"
+                    f"{exc.request.method} {exc.request.url}{trace_message}; "
+                    f"response={response_text}"
                 ) from exc
             if not response.content:
                 return {}

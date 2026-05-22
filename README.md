@@ -9,9 +9,12 @@
 - macOS, Linux, Windows PowerShell에서 실행 가능
 - Telegram Bot long polling 지원
 - HTTP `/commands` API로 로컬 테스트 가능
-- OpenAI 기반 메인 에이전트가 자연어 요청을 실행 계획으로 변환
+- 분석/계획 서브 에이전트가 자연어 요청을 실행 계획과 대상 선택 조건으로 변환
+- 정보 수집 서브 에이전트가 필요한 채널 최신화 단계를 선행 배치
+- 취합 및 판단 서브 에이전트가 직전 목록/채널 전체/조건부 문의 대상을 확정
 - 채널별 서브 에이전트가 동기화, 답변 초안, 전송, 상담 종료 처리
 - 답변 초안 전용 서브 에이전트가 이전 대화 전체를 기반으로 초안 생성
+- 다건 문의에 대한 조건부 답변 초안 생성 지원
 - 문의 상세 또는 초안 요청 시 해당 문의의 이전 대화 기록 전체 출력
 - 주문내역 조회 시 고객 주문 내역, 옵션, 수량, 주문번호, 주문 상태 출력
 - 고객에게 특정 메시지를 보내는 `send_reply` 작업만 승인 필요
@@ -26,9 +29,14 @@ flowchart TD
     U["운영자<br/>Telegram 또는 HTTP API"] --> IN["입력 수신<br/>telegram_bot.py / POST /commands"]
     IN --> AUDIT1["요청 감사 로그 기록<br/>logs/audit/YYYY-MM-DD.jsonl"]
     IN --> CTX["사용자 컨텍스트 조회<br/>번호표, 승인 대기, 현재 상담"]
-    CTX --> PLAN["메인 에이전트<br/>자연어 요청 분석 및 실행 계획 생성"]
-    PLAN --> OPT["프로세스 최적화<br/>필요 시 sync 선행<br/>맥락 변경 시 close_ticket 추가"]
-    OPT --> APPROVAL{"고객 메시지<br/>전송 작업인가?"}
+    CTX --> PLAN["분석/계획 서브 에이전트<br/>요청 분석, 대상 범위/필터 설정<br/>사용할 서브 에이전트 계획"]
+    PLAN --> INFO{"정보 수집 필요?"}
+    INFO -- "예" --> COLLECT["정보 수집 서브 에이전트<br/>Kakao/Naver 최신 문의 동기화"]
+    INFO -- "아니오" --> ROUTE["실행 후보 액션 정리"]
+    COLLECT --> REPO["SQLite 저장소<br/>문의, 메시지, 상태 저장"]
+    REPO --> ROUTE
+    ROUTE --> JUDGE["취합 및 판단 서브 에이전트<br/>직전 목록/채널 전체/조건부 후보 판단<br/>구체 대화 ID로 실행 계획 확정"]
+    JUDGE --> APPROVAL{"고객 메시지<br/>전송 작업인가?"}
 
     APPROVAL -- "예: send_reply" --> WAIT["승인 대기 저장<br/>prepared_api, 사유, 주의사항 출력"]
     WAIT --> OPAPPROVE{"운영자 승인?"}
@@ -37,13 +45,13 @@ flowchart TD
 
     APPROVAL -- "아니오" --> EXEC["즉시 실행"]
     EXEC --> SYNC["sync<br/>Kakao/Naver 문의 동기화"]
-    EXEC --> DETAIL["conversation_detail<br/>이전 대화 전체 조회"]
-    EXEC --> ORDER["order_lookup<br/>주문 상세 API 조회 및 모바일 포맷 출력"]
-    EXEC --> DRAFT["draft_reply<br/>초안 전용 서브 에이전트"]
+    EXEC --> DETAIL["conversation_detail<br/>채널 서브 에이전트가 이전 대화 조회"]
+    EXEC --> ORDER["order_lookup<br/>채널 서브 에이전트가 주문 상세 API 조회"]
+    EXEC --> DRAFT["draft_reply<br/>답변 초안 서브 에이전트"]
     EXEC --> CLOSE["close_ticket<br/>상담 종료 API 또는 로컬 상태 정리"]
-    EXEC --> SUMMARY["summary<br/>미처리 문의 목록 및 번호표 출력"]
+    EXEC --> SUMMARY["summary<br/>전체 또는 채널별 미처리 문의 목록 출력"]
 
-    SYNC --> REPO["SQLite 저장소<br/>문의, 메시지, 상태 저장"]
+    SYNC --> REPO
     DETAIL --> REPO
     ORDER --> REPO
     DRAFT --> REPO
@@ -64,6 +72,7 @@ flowchart TD
     NAVER <--> SEND
     NAVER <--> CLOSE
     OPENAI["OpenAI API"] <--> PLAN
+    OPENAI <--> JUDGE
     OPENAI <--> DRAFT
 ```
 
@@ -71,23 +80,32 @@ flowchart TD
 
 - 입력 채널은 Telegram과 HTTP API 두 가지이며, 내부에서는 동일하게 `MainAgent.handle_message()` 흐름을 사용합니다.
 - 모든 사용자 요청과 실행 결과는 감사 로그에 남습니다.
-- 메인 에이전트는 실행 전에 번호표, 승인 대기 상태, 현재 상담 컨텍스트를 조회합니다.
-- 조회성 작업은 승인 없이 즉시 실행하고, 필요한 경우 최신 채널 동기화를 먼저 수행합니다.
+- 분석/계획 서브 에이전트는 번호표, 승인 대기 상태, 현재 상담 컨텍스트를 참고해 필요한 서브 에이전트와 대상 범위를 계획합니다.
+- 정보 수집 서브 에이전트는 조회/선택/초안 생성 전에 필요한 채널 동기화를 먼저 수행하도록 계획을 보강합니다.
+- 취합 및 판단 서브 에이전트는 `지금 나열해준 문의`, `네이버 채널 문의`, `3mm S/L 구매건` 같은 범위/조건을 실제 대화 ID 목록으로 확정합니다.
 - 답변 초안은 별도 `DraftReplyAgent`가 이전 대화 전체를 기반으로 생성합니다.
 - 고객에게 실제 메시지를 보내는 `send_reply`만 승인 대기 상태로 저장됩니다.
 - 주문 조회는 문의 데이터에서 상품 주문번호를 찾고, Naver 주문 상세 API를 호출한 뒤 모바일 친화 포맷으로 출력합니다.
 - 실행 후 SQLite 저장소와 날짜별 감사 로그가 갱신되고, 결과가 Telegram 또는 HTTP 응답으로 반환됩니다.
 
+가능한 요청 예시:
+
+- `지금 나열해준 배송지연 문의건들에 대해서는 연휴로 인한 배송지연이 예상된다고 답변하는 초안 작성해 줘`
+- `문의건들 중에서 3mm S, L 사이즈 구매건들에 대해서 다음주 중 입고 후 출고 처리 가능하다는 초안 작성해 줘`
+- `네이버 채널 문의건들만 최신화해서 보여줘`
+- `카카오 채널 문의건 전체에 배송지연 안내 답변 초안 작성해줘`
+
 ## 동작 흐름
 
 1. 운영자가 Telegram 또는 HTTP API로 요청합니다.
-2. 메인 에이전트가 요청을 분석해 실행 계획을 만듭니다.
-3. 최신 데이터가 필요한 조회 작업은 먼저 채널 동기화를 수행합니다.
-4. 고객에게 메시지를 보내지 않는 작업은 즉시 실행됩니다.
-5. 고객에게 특정 답변을 보내는 작업은 실행 계획, 사유, 호출 예정 API를 보여준 뒤 승인 대기합니다.
-6. 운영자가 `승인` 또는 `실행`이라고 답하면 고객 메시지를 전송합니다.
-7. 운영자가 `취소`라고 답하면 승인 대기 중인 계획을 버립니다.
-8. 직전 상담과 다른 맥락의 요청이면 현재 상담 종료 API를 자동으로 호출하도록 계획을 보강합니다.
+2. 분석/계획 서브 에이전트가 요청을 분석해 실행 계획, 대상 범위, 대상 필터를 만듭니다.
+3. 정보 수집 서브 에이전트가 최신 데이터가 필요한 작업 앞에 채널 동기화를 배치합니다.
+4. 취합 및 판단 서브 에이전트가 조건에 맞는 문의를 실제 대화 ID로 확정합니다.
+5. 고객에게 메시지를 보내지 않는 작업은 즉시 실행됩니다.
+6. 고객에게 특정 답변을 보내는 작업은 실행 계획, 사유, 호출 예정 API를 보여준 뒤 승인 대기합니다.
+7. 운영자가 `승인` 또는 `실행`이라고 답하면 고객 메시지를 전송합니다.
+8. 운영자가 `취소`라고 답하면 승인 대기 중인 계획을 버립니다.
+9. 직전 상담과 다른 맥락의 요청이면 현재 상담 종료 API를 자동으로 호출하도록 계획을 보강합니다.
 
 상담 종료 API는 채널별 종료 path가 설정된 경우에만 실제 외부 API를 호출합니다. path가 비어 있으면 로컬 상태만 정리하거나 skip 결과를 반환합니다.
 
@@ -96,7 +114,10 @@ flowchart TD
 - `app/main.py`: FastAPI 애플리케이션 진입점
 - `app/api.py`: 헬스 체크, 명령 API, 채널 웹훅 API
 - `app/telegram_bot.py`: Telegram Bot API long polling 워커
-- `app/agents/main_agent.py`: 자연어 분석, 실행 계획 생성, 승인 플로우, 주문 조회 포맷
+- `app/agents/main_agent.py`: 전체 파이프라인 오케스트레이션, 승인 플로우, 주문 조회 포맷
+- `app/agents/planning_agent.py`: 자연어 요청 분석, 대상 범위/필터 및 서브 에이전트 계획
+- `app/agents/information_collector_agent.py`: 최신 정보 수집을 위한 채널 동기화 단계 보강
+- `app/agents/judgement_agent.py`: 조건부/다건 문의 후보 취합 및 실행 대상 판단
 - `app/agents/sub_agent.py`: 채널별 CS 처리 공통 서브 에이전트
 - `app/agents/draft_reply_agent.py`: 답변 초안 생성 전용 서브 에이전트
 - `app/channels/kakao.py`: Kakao 채널 API 클라이언트
@@ -114,6 +135,12 @@ flowchart TD
 - `draft_reply`: 이전 대화 전체를 기반으로 답변 초안 생성
 - `send_reply`: 고객에게 답변 전송, 반드시 운영자 승인 필요
 - `close_ticket`: 상담 종료 처리
+
+`draft_reply`, `send_reply`, `conversation_detail`, `order_lookup`, `close_ticket`은 단일 `conversation_id`뿐 아니라 `target_scope`와 `target_filter`를 통해 다건 대상을 지정할 수 있습니다.
+
+- `last_listed`: 직전에 사용자에게 보여준 문의 목록에서 선택
+- `channel_open`: 특정 채널의 미처리 문의 전체에서 선택
+- `all_open`: 전체 채널의 미처리 문의에서 선택
 
 ## 설치
 
@@ -222,6 +249,7 @@ NAVER_TOKEN_TYPE=SELF
 NAVER_OAUTH_TOKEN_PATH=/v1/oauth2/token
 NAVER_LIST_CONVERSATIONS_PATH=/v1/pay-user/inquiries
 NAVER_INQUIRY_SEARCH_DAYS=30
+NAVER_INQUIRY_PAGE_SIZE=50
 NAVER_ORDER_DETAIL_PATH=/v1/pay-order/seller/product-orders/query
 NAVER_SEND_MESSAGE_PATH=/v1/pay-merchant/inquiries/{conversation_id}/answer
 NAVER_UPDATE_STATUS_PATH=

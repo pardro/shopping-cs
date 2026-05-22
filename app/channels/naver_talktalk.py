@@ -24,6 +24,7 @@ class NaverTalkTalkClient(ApiChannelClient):
         self._token_path = settings.naver_oauth_token_path
         self._list_path = settings.naver_list_conversations_path
         self._inquiry_search_days = settings.naver_inquiry_search_days
+        self._inquiry_page_size = settings.naver_inquiry_page_size
         self._order_detail_path = settings.naver_order_detail_path
         self._send_path = settings.naver_send_message_path
         self._status_path = settings.naver_update_status_path
@@ -119,6 +120,8 @@ class NaverTalkTalkClient(ApiChannelClient):
         return {
             "startSearchDate": start_date.isoformat(),
             "endSearchDate": end_date.isoformat(),
+            "page": "1",
+            "size": str(min(max(self._inquiry_page_size, 1), 100)),
         }
 
     async def get_order_details(self, product_order_ids: list[str]) -> dict[str, Any]:

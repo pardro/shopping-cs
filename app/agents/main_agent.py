@@ -4,6 +4,9 @@ from datetime import datetime
 from typing import Any
 
 from app.agents.draft_reply_agent import DraftReplyAgent
+from app.agents.information_collector_agent import InformationCollectorAgent
+from app.agents.judgement_agent import JudgementAgent
+from app.agents.planning_agent import PlanningAgent
 from app.agents.sub_agent import ChannelCsAgent
 from app.audit import AuditLogger
 from app.llm import ChatGPTClient
@@ -13,6 +16,7 @@ from app.models import (
     CommandResult,
     ExecutionPlan,
     PlannedAction,
+    TargetScope,
     TicketStatus,
 )
 from app.storage import CsRepository
@@ -34,6 +38,9 @@ class MainAgent:
         self._repository = repository
         self._llm = llm
         self._audit_logger = audit_logger
+        self._planning_agent = PlanningAgent(llm, self._planner_context_text)
+        self._information_collector_agent = InformationCollectorAgent()
+        self._judgement_agent = JudgementAgent(repository, llm)
 
     async def handle_command(self, text: str, user_key: str = "default") -> CommandResult:
         return await self.handle_message(text, user_key=user_key)
@@ -74,10 +81,61 @@ class MainAgent:
             )
             return CommandResult(ok=True, message=question, data={"plan": plan.model_dump()})
 
-        immediate_plan, approval_plan = self._split_plan_by_approval_requirement(plan)
         messages: list[str] = []
         results: list[str] = []
         ok = True
+
+        collector = self._information_collector_agent
+        information_plan, execution_plan = collector.split_information_actions(plan)
+        if information_plan.actions:
+            information_result = await self._execute_plan(information_plan, user_key)
+            ok = information_result.ok
+            messages.append(information_result.message)
+            results.extend(information_result.data.get("results", []))
+            if not information_result.ok:
+                return CommandResult(
+                    ok=False,
+                    message="\n\n".join(messages),
+                    data={"plan": plan.model_dump(), "results": results},
+                )
+
+        judged_plan_result = await self._judgement_agent.finalize_plan(execution_plan, user_key)
+        execution_plan = self._prepare_plan(judged_plan_result.plan, user_key)
+        if judged_plan_result.notes:
+            self._audit(
+                "plan_judged",
+                {
+                    "user_key": user_key,
+                    "notes": judged_plan_result.notes,
+                    "plan": execution_plan.model_dump(),
+                },
+            )
+        if execution_plan.needs_more_info or not execution_plan.actions:
+            if execution_plan.needs_more_info:
+                question = execution_plan.question or "수행할 대상 문의를 판단하려면 정보가 더 필요합니다."
+                self._audit(
+                    "plan_needs_more_info",
+                    {
+                        "user_key": user_key,
+                        "question": question,
+                        "plan": execution_plan.model_dump(),
+                    },
+                )
+                messages.append(question)
+            elif not messages:
+                messages.append("수행할 작업이 없습니다.")
+            return CommandResult(
+                ok=ok,
+                message="\n\n".join(messages),
+                data={
+                    "plan": plan.model_dump(),
+                    "execution_plan": execution_plan.model_dump(),
+                    "results": results,
+                    "judgement_notes": judged_plan_result.notes,
+                },
+            )
+
+        immediate_plan, approval_plan = self._split_plan_by_approval_requirement(execution_plan)
 
         if immediate_plan.actions:
             execution_result = await self._execute_plan(immediate_plan, user_key)
@@ -88,7 +146,12 @@ class MainAgent:
                 return CommandResult(
                     ok=False,
                     message="\n\n".join(messages),
-                    data={"plan": plan.model_dump(), "results": results},
+                    data={
+                        "plan": plan.model_dump(),
+                        "execution_plan": execution_plan.model_dump(),
+                        "results": results,
+                        "judgement_notes": judged_plan_result.notes,
+                    },
                 )
 
         if approval_plan.actions:
@@ -105,7 +168,12 @@ class MainAgent:
         return CommandResult(
             ok=ok,
             message="\n\n".join(messages),
-            data={"plan": plan.model_dump(), "results": results},
+            data={
+                "plan": plan.model_dump(),
+                "execution_plan": execution_plan.model_dump(),
+                "results": results,
+                "judgement_notes": judged_plan_result.notes,
+            },
         )
 
     @staticmethod
@@ -114,28 +182,26 @@ class MainAgent:
             [
                 "쇼핑몰 CS 비서 사용 예시:",
                 "카카오랑 네이버 문의를 동기화하고 미처리 건 요약해줘",
+                "네이버 채널 문의건들만 최신화해서 보여줘",
                 "카카오 kakao-test-001 고객에게 보낼 답변 초안을 만들어줘",
+                "카카오 채널 문의건 전체에 배송지연 안내 답변 초안 작성해줘",
+                "지금 나열해준 배송지연 문의건들에 대해 연휴 배송지연 답변 초안 작성해줘",
                 "네이버 naver-test-001 고객에게 '확인 후 안내드리겠습니다'라고 보내줘",
                 "카카오 kakao-test-001 상담 종료 처리해줘",
                 "",
                 "흐름:",
-                "1. 조회, 동기화, 초안, 상담 종료는 바로 실행합니다.",
-                "2. 고객에게 특정 메시지를 전송하는 작업만 먼저 승인 요청을 드립니다.",
-                "3. 직전 상담과 다른 맥락의 요청을 하면 직전 상담은 자동 종료합니다.",
-                "4. 전송 계획이 맞으면 '승인' 또는 '실행'이라고 답장하세요.",
-                "5. 취소하려면 '취소'라고 답장하세요.",
+                "1. 분석/계획 에이전트가 요청을 해석하고 필요한 서브 에이전트를 고릅니다.",
+                "2. 필요하면 채널 최신화로 정보를 먼저 수집합니다.",
+                "3. 취합 및 판단 에이전트가 조건에 맞는 문의 대상을 확정합니다.",
+                "4. 조회, 동기화, 초안, 상담 종료는 바로 실행합니다.",
+                "5. 고객에게 특정 메시지를 전송하는 작업만 먼저 승인 요청을 드립니다.",
+                "6. 전송 계획이 맞으면 '승인' 또는 '실행'이라고 답장하세요.",
+                "7. 취소하려면 '취소'라고 답장하세요.",
             ]
         )
 
     async def _create_plan(self, user_request: str, user_key: str) -> ExecutionPlan:
-        parsed = await self._llm.complete_json(
-            system_prompt=self._planner_system_prompt(),
-            user_prompt=self._planner_user_prompt(user_request, user_key),
-            schema=ExecutionPlan,
-        )
-        if not isinstance(parsed, ExecutionPlan):
-            raise ValueError("Invalid planner response")
-        return parsed
+        return await self._planning_agent.create_plan(user_request, user_key)
 
     async def _execute_pending_plan(self, user_key: str) -> CommandResult:
         plan = self._repository.get_pending_plan(user_key)
@@ -267,15 +333,23 @@ class MainAgent:
     async def _execute_action(self, action: PlannedAction, user_key: str) -> str:
         if action.type == ActionType.SYNC:
             synced: dict[str, int] = {}
+            failures: dict[str, str] = {}
             targets = [action.channel] if action.channel else list(self._sub_agents.keys())
             for channel in targets:
                 if channel is None:
                     continue
-                synced[channel.value] = await self._sub_agents[channel].sync()
-            return ", ".join(f"{channel} {count}건 동기화" for channel, count in synced.items())
+                try:
+                    synced[channel.value] = await self._sub_agents[channel].sync()
+                except Exception as exc:
+                    if action.channel:
+                        raise
+                    failures[channel.value] = str(exc)
+            parts = [f"{channel} {count}건 동기화" for channel, count in synced.items()]
+            parts.extend(f"{channel} 동기화 실패: {error}" for channel, error in failures.items())
+            return ", ".join(parts)
 
         if action.type == ActionType.SUMMARY:
-            return self._summary_text(user_key=user_key)
+            return self._summary_text(user_key=user_key, channel=action.channel)
 
         channel = self._require_channel(action)
         conversation_id = self._require_conversation_id(action)
@@ -326,25 +400,38 @@ class MainAgent:
 
         raise ValueError(f"지원하지 않는 액션입니다: {action.type}")
 
-    def _summary_text(self, user_key: str | None = None) -> str:
+    def _summary_text(
+        self,
+        user_key: str | None = None,
+        channel: ChannelName | None = None,
+    ) -> str:
         summaries = self._repository.summarize()
-        lines = ["채널별 CS 현황"]
+        lines = [f"{channel.value} CS 현황" if channel else "채널별 CS 현황"]
         for summary in summaries:
+            if channel and summary.channel != channel:
+                continue
             lines.append(
                 f"- {summary.channel.value}: open {summary.open_count}, "
                 f"pending {summary.pending_count}, closed {summary.closed_count}"
             )
-        open_tickets = self._repository.list_conversations(status=TicketStatus.OPEN, limit=50)
+        open_tickets = self._repository.list_conversations(
+            channel=channel,
+            status=TicketStatus.OPEN,
+            limit=50,
+        )
         mapping: dict[str, dict[str, str]] = {channel.value: {} for channel in ChannelName}
         if open_tickets:
             lines.append("\n미처리 문의 목록")
-            for channel in ChannelName:
-                channel_tickets = [ticket for ticket in open_tickets if ticket.channel == channel]
+            channels = [channel] if channel else list(ChannelName)
+            for current_channel in channels:
+                channel_tickets = [
+                    ticket for ticket in open_tickets if ticket.channel == current_channel
+                ]
                 if not channel_tickets:
                     continue
-                lines.append(f"\n{channel.value}")
+                lines.append(f"\n{current_channel.value}")
                 for index, ticket in enumerate(channel_tickets, start=1):
-                    mapping[channel.value][str(index)] = ticket.conversation_id
+                    mapping[current_channel.value][str(index)] = ticket.conversation_id
                     lines.append(f"{index}. {self._ticket_line(ticket)}")
         if user_key:
             self._update_user_context(
@@ -588,27 +675,40 @@ class MainAgent:
     def _describe_action(action: PlannedAction) -> str:
         channel = action.channel.value if action.channel else "전체 채널"
         target = f" #{action.conversation_id}" if action.conversation_id else ""
+        selector = MainAgent._target_selector_text(action)
         if action.type == ActionType.SYNC:
             return f"{channel} 대화 동기화"
         if action.type == ActionType.SUMMARY:
-            return "CS 현황 요약"
+            return f"{channel} CS 현황 요약" if action.channel else "CS 현황 요약"
         if action.type == ActionType.CONVERSATION_DETAIL:
-            return f"{channel}{target} 이전 대화 기록 조회"
+            return f"{channel}{target or selector} 이전 대화 기록 조회"
         if action.type == ActionType.ORDER_LOOKUP:
-            return f"{channel}{target} 주문내역 조회"
+            return f"{channel}{target or selector} 주문내역 조회"
         if action.type == ActionType.DRAFT_REPLY:
-            return f"{channel}{target} 답변 초안 생성"
+            return f"{channel}{target or selector} 답변 초안 생성"
         if action.type == ActionType.SEND_REPLY:
-            return f"{channel}{target} 고객 답변 전송: {action.message}"
+            return f"{channel}{target or selector} 고객 답변 전송: {action.message}"
         if action.type == ActionType.CLOSE_TICKET:
-            return f"{channel}{target} 상담 종료"
+            return f"{channel}{target or selector} 상담 종료"
         return str(action.type)
 
-    def _planner_user_prompt(self, user_request: str, user_key: str) -> str:
+    @staticmethod
+    def _target_selector_text(action: PlannedAction) -> str:
+        if action.target_scope == TargetScope.EXPLICIT:
+            return ""
+        labels = {
+            TargetScope.LAST_LISTED: " 직전 목록",
+            TargetScope.CHANNEL_OPEN: " 미처리 전체",
+            TargetScope.ALL_OPEN: " 전체 미처리",
+        }
+        selector = labels.get(action.target_scope, f" {action.target_scope.value}")
+        if action.target_filter:
+            selector = f"{selector} 중 '{action.target_filter}'"
+        return selector
+
+    def _planner_context_text(self, user_key: str) -> str:
         return "\n".join(
             [
-                f"사용자 요청: {user_request}",
-                "",
                 "현재 CS 상태:",
                 self._summary_text(),
                 "",
@@ -620,41 +720,6 @@ class MainAgent:
             ]
         )
 
-    @staticmethod
-    def _planner_system_prompt() -> str:
-        return (
-            "You are a Korean shopping mall CS assistant planner. "
-            "Analyze the user's natural language request and create a safe execution plan. "
-            "Do not execute anything. Return only structured data matching the schema. "
-            "Available actions are: sync, summary, conversation_detail, order_lookup, "
-            "draft_reply, send_reply, close_ticket. "
-            "Use channel values only when known: kakao or naver. "
-            "Prefer freshness over minimizing API calls. It is acceptable to sync before "
-            "reading, summarizing, or drafting from conversations. "
-            "If the user asks to list unresolved/open inquiries by channel, use summary. "
-            "If the user asks about the details, context, or previous conversation of a "
-            "specific inquiry without asking for a reply draft, use conversation_detail. "
-            "If the user asks to check order history, order details, order status, "
-            "배송 상태, 주문 상태, 주문내역, use order_lookup. "
-            "If the user asks to sync and then list or summarize, create sync first "
-            "and summary second. "
-            "If the user says '초안', use draft_reply, not send_reply. "
-            "If the user says '보내줘' or clearly asks to send to the customer, use send_reply. "
-            "If the user references a numbered inquiry such as '카카오 1번', "
-            "resolve it using the provided ticket mapping. "
-            "For send_reply and close_ticket, channel and conversation_id are required. "
-            "For order_lookup, channel and conversation_id are required. "
-            "For draft_reply, put any requested answer direction or quoted content in message. "
-            "For send_reply, message is required and must be exactly what should be "
-            "sent to the customer. "
-            "If required information is missing, set needs_more_info=true and ask "
-            "a concise Korean question. "
-            "For risky customer-facing actions, add a risk note. "
-            "Only send_reply actions require later approval. Other actions will be "
-            "executed immediately. "
-            "Never mark actions as already done in the plan."
-        )
-
     def _prepare_plan(self, plan: ExecutionPlan, user_key: str) -> ExecutionPlan:
         for action in plan.actions:
             action.conversation_id = self._resolve_numbered_reference(action, user_key)
@@ -662,65 +727,10 @@ class MainAgent:
         return plan
 
     def _optimize_plan_for_fresh_context(self, plan: ExecutionPlan) -> ExecutionPlan:
-        optimized_actions: list[PlannedAction] = []
-        synced_channels: set[ChannelName] = set()
-        synced_all = False
-
-        for action in plan.actions:
-            if action.type == ActionType.SYNC:
-                optimized_actions.append(action)
-                if action.channel:
-                    synced_channels.add(action.channel)
-                else:
-                    synced_all = True
-                continue
-
-            sync_action = self._sync_action_needed(action, synced_channels, synced_all)
-            if sync_action:
-                optimized_actions.append(sync_action)
-                if sync_action.channel:
-                    synced_channels.add(sync_action.channel)
-                else:
-                    synced_all = True
-
-            optimized_actions.append(action)
-
-        if optimized_actions == plan.actions:
-            return plan
-        for action in optimized_actions:
+        optimized = self._information_collector_agent.add_freshness_steps(plan)
+        for action in optimized.actions:
             action.prepared_api = self._prepared_api_text(action)
-        return plan.model_copy(update={"actions": optimized_actions})
-
-    @staticmethod
-    def _sync_action_needed(
-        action: PlannedAction,
-        synced_channels: set[ChannelName],
-        synced_all: bool,
-    ) -> PlannedAction | None:
-        if action.type == ActionType.SUMMARY:
-            if synced_all:
-                return None
-            return PlannedAction(
-                type=ActionType.SYNC,
-                reason="최신 문의 목록을 기준으로 요약하기 위해 먼저 모든 채널을 동기화합니다.",
-                prepared_api="GET kakao/naver 대화 목록 API",
-            )
-
-        if action.type in {
-            ActionType.CONVERSATION_DETAIL,
-            ActionType.ORDER_LOOKUP,
-            ActionType.DRAFT_REPLY,
-        }:
-            if not action.channel or synced_all or action.channel in synced_channels:
-                return None
-            return PlannedAction(
-                type=ActionType.SYNC,
-                channel=action.channel,
-                reason="최신 전체 대화 기록을 기준으로 처리하기 위해 해당 채널을 먼저 동기화합니다.",
-                prepared_api=f"GET {action.channel.value} 대화 목록 API",
-            )
-
-        return None
+        return optimized
 
     def _append_contextual_close_if_needed(
         self,
@@ -785,23 +795,29 @@ class MainAgent:
     def _prepared_api_text(action: PlannedAction) -> str:
         channel = action.channel.value if action.channel else "kakao/naver"
         conversation_id = action.conversation_id or "{conversation_id}"
+        selector = MainAgent._target_selector_text(action).strip()
         if action.type == ActionType.SYNC:
             return f"GET {channel} 대화 목록 API"
         if action.type == ActionType.SUMMARY:
-            return "로컬 DB 미처리 문의 조회"
+            return f"로컬 DB {channel} 미처리 문의 조회"
         if action.type == ActionType.CONVERSATION_DETAIL:
-            return f"로컬 DB 전체 이전 대화 기록 조회, 대상 {channel} #{conversation_id}"
+            target = f"{channel} #{conversation_id}" if action.conversation_id else selector
+            return f"로컬 DB 전체 이전 대화 기록 조회, 대상 {target}"
         if action.type == ActionType.ORDER_LOOKUP:
-            return f"로컬 DB 문의 정보와 채널 주문 상세 API 조회, 대상 {channel} #{conversation_id}"
+            target = f"{channel} #{conversation_id}" if action.conversation_id else selector
+            return f"로컬 DB 문의 정보와 채널 주문 상세 API 조회, 대상 {target}"
         if action.type == ActionType.DRAFT_REPLY:
+            target = f"{channel} #{conversation_id}" if action.conversation_id else selector
             return (
                 "로컬 DB 전체 이전 대화 기록 조회 후 "
-                f"OpenAI ChatGPT 답변 초안 생성, 대상 {channel} #{conversation_id}"
+                f"OpenAI ChatGPT 답변 초안 생성, 대상 {target}"
             )
         if action.type == ActionType.SEND_REPLY:
-            return f"POST {channel} 메시지 전송 API, 대상 #{conversation_id}"
+            target = f"#{conversation_id}" if action.conversation_id else selector
+            return f"POST {channel} 메시지 전송 API, 대상 {target}"
         if action.type == ActionType.CLOSE_TICKET:
-            return f"PATCH {channel} 상담 상태 변경 API, 대상 #{conversation_id}"
+            target = f"#{conversation_id}" if action.conversation_id else selector
+            return f"PATCH {channel} 상담 상태 변경 API, 대상 {target}"
         return "지원하지 않는 API 작업"
 
     def _last_ticket_mapping_text(self, user_key: str) -> str:

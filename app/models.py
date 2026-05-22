@@ -50,11 +50,20 @@ class ActionType(StrEnum):
     CLOSE_TICKET = "close_ticket"
 
 
+class TargetScope(StrEnum):
+    EXPLICIT = "explicit"
+    LAST_LISTED = "last_listed"
+    CHANNEL_OPEN = "channel_open"
+    ALL_OPEN = "all_open"
+
+
 class PlannedAction(BaseModel):
     type: ActionType
     channel: ChannelName | None = None
     conversation_id: str | None = None
     message: str | None = None
+    target_scope: TargetScope = TargetScope.EXPLICIT
+    target_filter: str | None = None
     reason: str
     prepared_api: str | None = None
 
