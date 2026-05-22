@@ -6,7 +6,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        str_strip_whitespace=True,
+    )
 
     openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
     openai_model: str = Field(default="gpt-4o-mini", alias="OPENAI_MODEL")
@@ -27,32 +32,41 @@ class Settings(BaseSettings):
     kakao_rest_api_key: str = Field(default="", alias="KAKAO_REST_API_KEY")
     kakao_channel_id: str = Field(default="", alias="KAKAO_CHANNEL_ID")
     kakao_list_conversations_path: str = Field(
-        default="/v1/channels/{channel_id}/conversations",
+        default="",
         alias="KAKAO_LIST_CONVERSATIONS_PATH",
     )
     kakao_send_message_path: str = Field(
-        default="/v1/channels/{channel_id}/conversations/{conversation_id}/messages",
+        default="",
         alias="KAKAO_SEND_MESSAGE_PATH",
     )
     kakao_update_status_path: str = Field(
-        default="/v1/channels/{channel_id}/conversations/{conversation_id}/status",
+        default="",
         alias="KAKAO_UPDATE_STATUS_PATH",
     )
 
-    naver_talktalk_api_base_url: str = Field(default="", alias="NAVER_TALKTALK_API_BASE_URL")
+    naver_talktalk_api_base_url: str = Field(
+        default="https://api.commerce.naver.com/external",
+        alias="NAVER_TALKTALK_API_BASE_URL",
+    )
     naver_client_id: str = Field(default="", alias="NAVER_CLIENT_ID")
     naver_client_secret: str = Field(default="", alias="NAVER_CLIENT_SECRET")
     naver_talktalk_channel_id: str = Field(default="", alias="NAVER_TALKTALK_CHANNEL_ID")
+    naver_account_id: str = Field(default="", alias="NAVER_ACCOUNT_ID")
+    naver_token_type: Literal["SELF", "SELLER"] = Field(default="SELF", alias="NAVER_TOKEN_TYPE")
+    naver_oauth_token_path: str = Field(
+        default="/v1/oauth2/token",
+        alias="NAVER_OAUTH_TOKEN_PATH",
+    )
     naver_list_conversations_path: str = Field(
-        default="/v1/channels/{channel_id}/conversations",
+        default="/v1/pay-user/inquiries",
         alias="NAVER_LIST_CONVERSATIONS_PATH",
     )
     naver_send_message_path: str = Field(
-        default="/v1/channels/{channel_id}/conversations/{conversation_id}/messages",
+        default="/v1/pay-merchant/inquiries/{conversation_id}/answer",
         alias="NAVER_SEND_MESSAGE_PATH",
     )
     naver_update_status_path: str = Field(
-        default="/v1/channels/{channel_id}/conversations/{conversation_id}/status",
+        default="",
         alias="NAVER_UPDATE_STATUS_PATH",
     )
 

@@ -28,6 +28,8 @@ class KakaoBizCenterClient(ApiChannelClient):
         return template.format(channel_id=self._channel_id, conversation_id=conversation_id or "")
 
     async def list_conversations(self, status: TicketStatus | None = None) -> list[Conversation]:
+        if not self._list_path:
+            return []
         payload = await self._request(
             "GET",
             self._path(self._list_path),
@@ -38,6 +40,8 @@ class KakaoBizCenterClient(ApiChannelClient):
         return [normalize_conversation(channel=self.channel, item=item) for item in items]
 
     async def send_message(self, conversation_id: str, text: str) -> dict[str, Any]:
+        if not self._send_path:
+            raise ValueError("KAKAO_SEND_MESSAGE_PATH is not configured")
         return await self._request(
             "POST",
             self._path(self._send_path, conversation_id),
@@ -46,6 +50,8 @@ class KakaoBizCenterClient(ApiChannelClient):
         )
 
     async def update_status(self, conversation_id: str, status: TicketStatus) -> dict[str, Any]:
+        if not self._status_path:
+            return {"skipped": True, "reason": "KAKAO_UPDATE_STATUS_PATH is not configured"}
         return await self._request(
             "PATCH",
             self._path(self._status_path, conversation_id),

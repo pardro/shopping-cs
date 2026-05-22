@@ -19,6 +19,13 @@ class CheckResult:
 async def _run_check(name: str, check: Callable[[], Awaitable[str]]) -> CheckResult:
     try:
         detail = await check()
+    except httpx.HTTPStatusError as exc:
+        response_text = exc.response.text[:1000]
+        detail = (
+            f"{exc.response.status_code} {exc.response.reason_phrase} for "
+            f"{exc.request.method} {exc.request.url}; response={response_text}"
+        )
+        return CheckResult(name=name, ok=False, detail=_redact(detail))
     except Exception as exc:
         return CheckResult(name=name, ok=False, detail=_redact(str(exc)))
     return CheckResult(name=name, ok=True, detail=detail)
@@ -30,7 +37,9 @@ def _redact(text: str) -> str:
         settings.openai_api_key,
         settings.telegram_bot_token,
         settings.kakao_rest_api_key,
+        settings.naver_client_id,
         settings.naver_client_secret,
+        settings.naver_account_id,
     ]
     redacted = text
     for secret in secrets:
@@ -65,6 +74,9 @@ async def check_telegram() -> str:
 
 
 async def check_kakao() -> str:
+    settings = get_settings()
+    if not settings.kakao_list_conversations_path:
+        return "conversation list API is not configured; public Kakao REST API does not provide this endpoint"
     conversations = await KakaoBizCenterClient(get_settings()).list_conversations()
     return f"list conversations reachable: {len(conversations)} items"
 

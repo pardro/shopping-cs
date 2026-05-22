@@ -123,10 +123,14 @@ KAKAO_API_BASE_URL=https://...
 KAKAO_REST_API_KEY=...
 KAKAO_CHANNEL_ID=...
 
-NAVER_TALKTALK_API_BASE_URL=https://...
+NAVER_TALKTALK_API_BASE_URL=https://api.commerce.naver.com/external
 NAVER_CLIENT_ID=...
 NAVER_CLIENT_SECRET=...
-NAVER_TALKTALK_CHANNEL_ID=...
+NAVER_ACCOUNT_ID=
+NAVER_TOKEN_TYPE=SELF
+NAVER_OAUTH_TOKEN_PATH=/v1/oauth2/token
+NAVER_LIST_CONVERSATIONS_PATH=/v1/pay-user/inquiries
+NAVER_SEND_MESSAGE_PATH=/v1/pay-merchant/inquiries/{conversation_id}/answer
 ```
 
 ## 서버 실행
@@ -349,15 +353,16 @@ TELEGRAM_POLL_TIMEOUT_SECONDS=30
 KAKAO_API_BASE_URL=https://...
 KAKAO_REST_API_KEY=...
 KAKAO_CHANNEL_ID=...
-KAKAO_LIST_CONVERSATIONS_PATH=/v1/channels/{channel_id}/conversations
-KAKAO_SEND_MESSAGE_PATH=/v1/channels/{channel_id}/conversations/{conversation_id}/messages
-KAKAO_UPDATE_STATUS_PATH=/v1/channels/{channel_id}/conversations/{conversation_id}/status
+KAKAO_LIST_CONVERSATIONS_PATH=
+KAKAO_SEND_MESSAGE_PATH=
+KAKAO_UPDATE_STATUS_PATH=
 ```
 
 주의:
 
 - Kakao Developers의 REST API key와 카카오톡 비즈니스센터 상담 API 권한은 다를 수 있습니다.
-- 이 저장소의 기본 path는 예시입니다. 실제 계약/승인 문서의 엔드포인트로 교체하세요.
+- 공개 Kakao REST API에는 `/v1/channels/{channel_id}/conversations` 형식의 상담 대화 목록 API가 없습니다.
+- 카카오 상담/메시지 API는 별도 계약 또는 승인 문서의 엔드포인트가 있을 때만 path를 채우세요.
 
 참고:
 
@@ -369,24 +374,29 @@ KAKAO_UPDATE_STATUS_PATH=/v1/channels/{channel_id}/conversations/{conversation_i
 1. [네이버 커머스API 센터](https://apicenter.commerce.naver.com/)에 접속합니다.
 2. 스마트스토어 판매자 계정으로 로그인합니다.
 3. 애플리케이션을 생성하고 Client ID, Client Secret을 확인합니다.
-4. 문의/CS/톡톡 관련 API 사용 권한을 확인합니다.
-5. 승인된 API 문서 기준으로 base URL, 채널 ID, path를 `.env`에 입력합니다.
+4. 문의 API 사용 권한을 확인합니다.
+5. 승인된 API 문서 기준으로 base URL과 path를 `.env`에 입력합니다.
 
 ```env
-NAVER_TALKTALK_API_BASE_URL=https://api.commerce.naver.com
+NAVER_TALKTALK_API_BASE_URL=https://api.commerce.naver.com/external
 NAVER_CLIENT_ID=...
 NAVER_CLIENT_SECRET=...
-NAVER_TALKTALK_CHANNEL_ID=...
-NAVER_LIST_CONVERSATIONS_PATH=/v1/channels/{channel_id}/conversations
-NAVER_SEND_MESSAGE_PATH=/v1/channels/{channel_id}/conversations/{conversation_id}/messages
-NAVER_UPDATE_STATUS_PATH=/v1/channels/{channel_id}/conversations/{conversation_id}/status
+NAVER_TALKTALK_CHANNEL_ID=
+NAVER_ACCOUNT_ID=
+NAVER_TOKEN_TYPE=SELF
+NAVER_OAUTH_TOKEN_PATH=/v1/oauth2/token
+NAVER_LIST_CONVERSATIONS_PATH=/v1/pay-user/inquiries
+NAVER_SEND_MESSAGE_PATH=/v1/pay-merchant/inquiries/{conversation_id}/answer
+NAVER_UPDATE_STATUS_PATH=
 ```
 
 주의:
 
-- 네이버 커머스API는 OAuth 2.0 기반 인증을 사용할 수 있습니다.
-- 실제 API가 access token을 요구하면 채널 클라이언트에 토큰 발급 단계를 추가해야 합니다.
-- 톡톡 실시간 대화 API가 별도 제휴 권한으로 제공되는 경우, 발급받은 문서의 URL과 path로 교체하세요.
+- 네이버 커머스API는 OAuth 2.0 Client Credentials 방식으로 인증 토큰을 발급받은 뒤 `Authorization: Bearer` 헤더로 호출합니다.
+- 토큰 발급 시 Client Secret을 직접 보내지 않고 `client_id`, millisecond timestamp, `client_secret`으로 bcrypt 기반 전자서명을 생성합니다.
+- 스마트스토어 판매자가 직접 만든 애플리케이션은 보통 `NAVER_TOKEN_TYPE=SELF`를 사용합니다.
+- 솔루션/대행사가 특정 판매자 계정 권한으로 호출해야 하는 경우에만 `NAVER_TOKEN_TYPE=SELLER`와 판매자 UID인 `NAVER_ACCOUNT_ID`를 사용합니다.
+- 현재 구현은 커머스 API의 고객 문의 조회/답변 등록 엔드포인트 기준입니다. 톡톡 실시간 대화 API가 별도 제휴 권한으로 제공되는 경우, 발급받은 문서의 URL과 path로 교체하세요.
 
 참고:
 
