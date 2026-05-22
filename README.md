@@ -18,8 +18,8 @@
 - 문의 상세 또는 초안 요청 시 해당 문의의 이전 대화 기록 전체 출력
 - 주문내역 조회 시 고객 주문 내역, 옵션, 수량, 주문번호, 주문 상태 출력
 - 고객에게 특정 메시지를 보내는 `send_reply` 작업만 승인 필요
-- 사용자의 요청, 실행 계획, 실행 결과를 날짜별 JSONL 감사 로그로 저장
-- 날짜가 바뀌면 새 감사 로그 파일 생성
+- 사용자의 요청, 실행 계획, 실행 결과를 날짜별 사용자 대화 JSON 로그로 저장
+- 날짜가 바뀌면 새 대화 로그 파일 생성
 - `.gitignore`로 `.env`, 로그, DB, 가상환경 파일 제외
 
 ## 전체 서비스 파이프라인
@@ -27,7 +27,7 @@
 ```mermaid
 flowchart TD
     U["운영자<br/>Telegram 또는 HTTP API"] --> IN["입력 수신<br/>telegram_bot.py / POST /commands"]
-    IN --> AUDIT1["요청 감사 로그 기록<br/>logs/audit/YYYY-MM-DD.jsonl"]
+    IN --> AUDIT1["요청 대화 로그 준비<br/>logs/audit/YYYY-MM-DD_user-key.json"]
     IN --> CTX["사용자 컨텍스트 조회<br/>번호표, 승인 대기, 현재 상담"]
     CTX --> PLAN["분석/계획 서브 에이전트<br/>요청 분석, 대상 범위/필터 설정<br/>사용할 서브 에이전트 계획"]
     PLAN --> INFO{"정보 수집 필요?"}
@@ -60,7 +60,7 @@ flowchart TD
     SEND --> REPO
     CANCEL --> REPO
 
-    REPO --> AUDIT2["실행 성공/실패 감사 로그 기록"]
+    REPO --> AUDIT2["턴별 대화 로그 기록<br/>user/chatbot/action"]
     AUDIT2 --> OUT["결과 응답<br/>모바일 가독성 포맷"]
     OUT --> U
 
@@ -79,14 +79,14 @@ flowchart TD
 파이프라인 핵심:
 
 - 입력 채널은 Telegram과 HTTP API 두 가지이며, 내부에서는 동일하게 `MainAgent.handle_message()` 흐름을 사용합니다.
-- 모든 사용자 요청과 실행 결과는 감사 로그에 남습니다.
+- 모든 사용자 요청과 최종 응답, 응답 생성을 위한 내부 프로세스는 대화 로그에 남습니다.
 - 분석/계획 서브 에이전트는 번호표, 승인 대기 상태, 현재 상담 컨텍스트를 참고해 필요한 서브 에이전트와 대상 범위를 계획합니다.
 - 정보 수집 서브 에이전트는 조회/선택/초안 생성 전에 필요한 채널 동기화를 먼저 수행하도록 계획을 보강합니다.
 - 취합 및 판단 서브 에이전트는 `지금 나열해준 문의`, `네이버 채널 문의`, `3mm S/L 구매건` 같은 범위/조건을 실제 대화 ID 목록으로 확정합니다.
 - 답변 초안은 별도 `DraftReplyAgent`가 이전 대화 전체를 기반으로 생성합니다.
 - 고객에게 실제 메시지를 보내는 `send_reply`만 승인 대기 상태로 저장됩니다.
 - 주문 조회는 문의 데이터에서 상품 주문번호를 찾고, Naver 주문 상세 API를 호출한 뒤 모바일 친화 포맷으로 출력합니다.
-- 실행 후 SQLite 저장소와 날짜별 감사 로그가 갱신되고, 결과가 Telegram 또는 HTTP 응답으로 반환됩니다.
+- 실행 후 SQLite 저장소와 날짜별 대화 로그가 갱신되고, 결과가 Telegram 또는 HTTP 응답으로 반환됩니다.
 
 가능한 요청 예시:
 
@@ -123,7 +123,7 @@ flowchart TD
 - `app/channels/kakao.py`: Kakao 채널 API 클라이언트
 - `app/channels/naver_talktalk.py`: Naver Commerce API 클라이언트
 - `app/storage/repository.py`: SQLite 저장소, 사용자 컨텍스트, 승인 대기 계획
-- `app/audit.py`: 날짜별 감사 로그 기록
+- `app/audit.py`: 날짜별 사용자 대화 JSON 로그 기록
 - `app/check_apis.py`: `.env` 값 기반 외부 API 연결 점검
 
 ## 지원 액션
@@ -503,14 +503,45 @@ curl -X POST http://localhost:8000/webhooks/naver/cs \
   }'
 ```
 
-## 감사 로그
+## 대화 로그
 
-사용자 요청, 실행 계획, 승인 대기, 액션 성공/실패 내역은 `AUDIT_LOG_DIR` 아래 날짜별 JSONL 파일로 저장됩니다.
+사용자 요청, 최종 응답, 응답을 만들기 위한 계획/정보수집/판단/실행 상세는 `AUDIT_LOG_DIR` 아래 날짜별 사용자 JSON 파일로 저장됩니다.
 
 기본 경로:
 
 ```text
-./logs/audit/YYYY-MM-DD.jsonl
+./logs/audit/YYYY-MM-DD_{user_key}.json
+```
+
+로그 최상위에는 전체 대화의 `meta_data`가 있고, 각 턴은 `user`와 `chatbot` 키로 고정됩니다. `chatbot.action`에는 최종 출력에 사용된 계획, 정보 수집, 판단, 실행 결과가 순서대로 들어갑니다.
+
+```json
+{
+  "meta_data": {
+    "user_key": "telegram:8396910242",
+    "logging_start_time": "2026-05-22 15:31:00",
+    "log_date": "2026-05-22"
+  },
+  "conversations": [
+    {
+      "user": {
+        "text": "사용자 문의",
+        "timestamp": "2026-05-22 15:31:00"
+      },
+      "chatbot": {
+        "text": "최종 출력 답변",
+        "timestamp": "2026-05-22 15:31:00",
+        "action": [
+          {
+            "action_type": "planning_started",
+            "timestamp": "2026-05-22 15:31:00",
+            "agent": "PlanningAgent"
+          }
+        ]
+      }
+    }
+  ]
+}
 ```
 
 날짜가 바뀌면 새 파일에 기록됩니다. `logs/`는 `.gitignore`에 포함되어 저장소에 업로드되지 않습니다.

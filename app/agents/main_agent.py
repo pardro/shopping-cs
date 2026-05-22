@@ -47,39 +47,104 @@ class MainAgent:
 
     async def handle_message(self, text: str, user_key: str = "default") -> CommandResult:
         normalized = text.strip()
+        user_timestamp = datetime.now().astimezone()
+        process_log: list[dict[str, Any]] = []
         self._audit(
             "user_request",
             {
                 "user_key": user_key,
                 "text": text,
             },
+            process_log=process_log,
         )
         if not normalized:
-            return CommandResult(ok=True, message=self.help_text())
+            return self._finalize_turn(
+                CommandResult(ok=True, message=self.help_text()),
+                user_key=user_key,
+                user_text=text,
+                user_timestamp=user_timestamp,
+                process_log=process_log,
+            )
         if normalized.lower() in {"/help", "help", "도움말"}:
-            return CommandResult(ok=True, message=self.help_text())
+            return self._finalize_turn(
+                CommandResult(ok=True, message=self.help_text()),
+                user_key=user_key,
+                user_text=text,
+                user_timestamp=user_timestamp,
+                process_log=process_log,
+            )
         if self._is_cancel(normalized):
             self._repository.clear_pending_plan(user_key)
-            self._audit("pending_plan_cancelled", {"user_key": user_key})
-            return CommandResult(ok=True, message="대기 중인 실행 계획을 취소했습니다.")
+            self._audit(
+                "pending_plan_cancelled",
+                {"user_key": user_key},
+                process_log=process_log,
+            )
+            return self._finalize_turn(
+                CommandResult(ok=True, message="대기 중인 실행 계획을 취소했습니다."),
+                user_key=user_key,
+                user_text=text,
+                user_timestamp=user_timestamp,
+                process_log=process_log,
+            )
         if self._is_approval(normalized):
-            return await self._execute_pending_plan(user_key)
+            result = await self._execute_pending_plan(user_key, process_log=process_log)
+            return self._finalize_turn(
+                result,
+                user_key=user_key,
+                user_text=text,
+                user_timestamp=user_timestamp,
+                process_log=process_log,
+            )
 
         try:
+            self._audit(
+                "planning_started",
+                {"agent": "PlanningAgent"},
+                process_log=process_log,
+            )
             plan = await self._create_plan(normalized, user_key)
+            self._audit(
+                "plan_created",
+                {"agent": "PlanningAgent", "plan": plan.model_dump()},
+                process_log=process_log,
+            )
             plan = self._prepare_plan(plan, user_key)
             plan = self._optimize_plan_for_fresh_context(plan)
             plan = self._append_contextual_close_if_needed(plan, user_key)
+            self._audit(
+                "plan_prepared",
+                {"plan": plan.model_dump()},
+                process_log=process_log,
+            )
         except Exception as exc:
-            return CommandResult(ok=False, message=f"요청 분석 실패: {exc}")
+            self._audit(
+                "planning_failed",
+                {"error": str(exc)},
+                process_log=process_log,
+            )
+            return self._finalize_turn(
+                CommandResult(ok=False, message=f"요청 분석 실패: {exc}"),
+                user_key=user_key,
+                user_text=text,
+                user_timestamp=user_timestamp,
+                process_log=process_log,
+            )
 
         if plan.needs_more_info or not plan.actions:
             question = plan.question or "수행에 필요한 정보가 부족합니다. 조금 더 구체적으로 말씀해주세요."
             self._audit(
                 "plan_needs_more_info",
                 {"user_key": user_key, "question": question, "plan": plan.model_dump()},
+                process_log=process_log,
             )
-            return CommandResult(ok=True, message=question, data={"plan": plan.model_dump()})
+            return self._finalize_turn(
+                CommandResult(ok=True, message=question, data={"plan": plan.model_dump()}),
+                user_key=user_key,
+                user_text=text,
+                user_timestamp=user_timestamp,
+                process_log=process_log,
+            )
 
         messages: list[str] = []
         results: list[str] = []
@@ -88,17 +153,40 @@ class MainAgent:
         collector = self._information_collector_agent
         information_plan, execution_plan = collector.split_information_actions(plan)
         if information_plan.actions:
-            information_result = await self._execute_plan(information_plan, user_key)
+            self._audit(
+                "information_collection_started",
+                {
+                    "agent": "InformationCollectorAgent",
+                    "plan": information_plan.model_dump(),
+                },
+                process_log=process_log,
+            )
+            information_result = await self._execute_plan(
+                information_plan,
+                user_key,
+                process_log=process_log,
+            )
             ok = information_result.ok
             messages.append(information_result.message)
             results.extend(information_result.data.get("results", []))
             if not information_result.ok:
-                return CommandResult(
-                    ok=False,
-                    message="\n\n".join(messages),
-                    data={"plan": plan.model_dump(), "results": results},
+                return self._finalize_turn(
+                    CommandResult(
+                        ok=False,
+                        message="\n\n".join(messages),
+                        data={"plan": plan.model_dump(), "results": results},
+                    ),
+                    user_key=user_key,
+                    user_text=text,
+                    user_timestamp=user_timestamp,
+                    process_log=process_log,
                 )
 
+        self._audit(
+            "judgement_started",
+            {"agent": "JudgementAgent", "plan": execution_plan.model_dump()},
+            process_log=process_log,
+        )
         judged_plan_result = await self._judgement_agent.finalize_plan(execution_plan, user_key)
         execution_plan = self._prepare_plan(judged_plan_result.plan, user_key)
         if judged_plan_result.notes:
@@ -109,6 +197,7 @@ class MainAgent:
                     "notes": judged_plan_result.notes,
                     "plan": execution_plan.model_dump(),
                 },
+                process_log=process_log,
             )
         if execution_plan.needs_more_info or not execution_plan.actions:
             if execution_plan.needs_more_info:
@@ -120,11 +209,76 @@ class MainAgent:
                         "question": question,
                         "plan": execution_plan.model_dump(),
                     },
+                    process_log=process_log,
                 )
                 messages.append(question)
             elif not messages:
                 messages.append("수행할 작업이 없습니다.")
-            return CommandResult(
+            return self._finalize_turn(
+                CommandResult(
+                    ok=ok,
+                    message="\n\n".join(messages),
+                    data={
+                        "plan": plan.model_dump(),
+                        "execution_plan": execution_plan.model_dump(),
+                        "results": results,
+                        "judgement_notes": judged_plan_result.notes,
+                    },
+                ),
+                user_key=user_key,
+                user_text=text,
+                user_timestamp=user_timestamp,
+                process_log=process_log,
+            )
+
+        immediate_plan, approval_plan = self._split_plan_by_approval_requirement(execution_plan)
+
+        if immediate_plan.actions:
+            self._audit(
+                "execution_started",
+                {"plan": immediate_plan.model_dump()},
+                process_log=process_log,
+            )
+            execution_result = await self._execute_plan(
+                immediate_plan,
+                user_key,
+                process_log=process_log,
+            )
+            ok = execution_result.ok
+            messages.append(execution_result.message)
+            results.extend(execution_result.data.get("results", []))
+            if not execution_result.ok:
+                return self._finalize_turn(
+                    CommandResult(
+                        ok=False,
+                        message="\n\n".join(messages),
+                        data={
+                            "plan": plan.model_dump(),
+                            "execution_plan": execution_plan.model_dump(),
+                            "results": results,
+                            "judgement_notes": judged_plan_result.notes,
+                        },
+                    ),
+                    user_key=user_key,
+                    user_text=text,
+                    user_timestamp=user_timestamp,
+                    process_log=process_log,
+                )
+
+        if approval_plan.actions:
+            self._repository.save_pending_plan(user_key, approval_plan)
+            self._audit(
+                "send_reply_approval_requested",
+                {"user_key": user_key, "plan": approval_plan.model_dump()},
+                process_log=process_log,
+            )
+            messages.append(self._format_plan_for_approval(approval_plan))
+
+        if not messages:
+            messages.append("수행할 작업이 없습니다.")
+
+        return self._finalize_turn(
+            CommandResult(
                 ok=ok,
                 message="\n\n".join(messages),
                 data={
@@ -133,47 +287,11 @@ class MainAgent:
                     "results": results,
                     "judgement_notes": judged_plan_result.notes,
                 },
-            )
-
-        immediate_plan, approval_plan = self._split_plan_by_approval_requirement(execution_plan)
-
-        if immediate_plan.actions:
-            execution_result = await self._execute_plan(immediate_plan, user_key)
-            ok = execution_result.ok
-            messages.append(execution_result.message)
-            results.extend(execution_result.data.get("results", []))
-            if not execution_result.ok:
-                return CommandResult(
-                    ok=False,
-                    message="\n\n".join(messages),
-                    data={
-                        "plan": plan.model_dump(),
-                        "execution_plan": execution_plan.model_dump(),
-                        "results": results,
-                        "judgement_notes": judged_plan_result.notes,
-                    },
-                )
-
-        if approval_plan.actions:
-            self._repository.save_pending_plan(user_key, approval_plan)
-            self._audit(
-                "send_reply_approval_requested",
-                {"user_key": user_key, "plan": approval_plan.model_dump()},
-            )
-            messages.append(self._format_plan_for_approval(approval_plan))
-
-        if not messages:
-            messages.append("수행할 작업이 없습니다.")
-
-        return CommandResult(
-            ok=ok,
-            message="\n\n".join(messages),
-            data={
-                "plan": plan.model_dump(),
-                "execution_plan": execution_plan.model_dump(),
-                "results": results,
-                "judgement_notes": judged_plan_result.notes,
-            },
+            ),
+            user_key=user_key,
+            user_text=text,
+            user_timestamp=user_timestamp,
+            process_log=process_log,
         )
 
     @staticmethod
@@ -203,22 +321,49 @@ class MainAgent:
     async def _create_plan(self, user_request: str, user_key: str) -> ExecutionPlan:
         return await self._planning_agent.create_plan(user_request, user_key)
 
-    async def _execute_pending_plan(self, user_key: str) -> CommandResult:
+    async def _execute_pending_plan(
+        self,
+        user_key: str,
+        process_log: list[dict[str, Any]] | None = None,
+    ) -> CommandResult:
         plan = self._repository.get_pending_plan(user_key)
         if not plan:
+            self._audit(
+                "pending_plan_missing",
+                {"user_key": user_key},
+                process_log=process_log,
+            )
             return CommandResult(
                 ok=False,
                 message="승인할 실행 계획이 없습니다. 먼저 원하는 CS 작업을 자연어로 요청해주세요.",
             )
 
-        self._audit("pending_plan_approved", {"user_key": user_key, "plan": plan.model_dump()})
-        result = await self._execute_plan(plan, user_key)
+        self._audit(
+            "pending_plan_approved",
+            {"user_key": user_key, "plan": plan.model_dump()},
+            process_log=process_log,
+        )
+        result = await self._execute_plan(plan, user_key, process_log=process_log)
         self._repository.clear_pending_plan(user_key)
+        self._audit(
+            "pending_plan_cleared",
+            {"user_key": user_key},
+            process_log=process_log,
+        )
         return result
 
-    async def _execute_plan(self, plan: ExecutionPlan, user_key: str) -> CommandResult:
+    async def _execute_plan(
+        self,
+        plan: ExecutionPlan,
+        user_key: str,
+        process_log: list[dict[str, Any]] | None = None,
+    ) -> CommandResult:
         if any(action.type == ActionType.ORDER_LOOKUP for action in plan.actions):
-            return await self._execute_order_lookup_plan(plan, user_key)
+            return await self._execute_order_lookup_plan(
+                plan,
+                user_key,
+                process_log=process_log,
+            )
 
         results: list[str] = []
         ok = True
@@ -234,6 +379,7 @@ class MainAgent:
                         "action": action.model_dump(),
                         "result": result,
                     },
+                    process_log=process_log,
                 )
             except Exception as exc:
                 ok = False
@@ -246,6 +392,7 @@ class MainAgent:
                         "action": action.model_dump(),
                         "error": str(exc),
                     },
+                    process_log=process_log,
                 )
                 remaining = len(plan.actions) - index
                 if remaining:
@@ -263,6 +410,7 @@ class MainAgent:
         self,
         plan: ExecutionPlan,
         user_key: str,
+        process_log: list[dict[str, Any]] | None = None,
     ) -> CommandResult:
         result_lines: list[str] = []
         content_blocks: list[str] = []
@@ -288,6 +436,7 @@ class MainAgent:
                         "action": action.model_dump(),
                         "result": result,
                     },
+                    process_log=process_log,
                 )
             except Exception as exc:
                 ok = False
@@ -301,6 +450,7 @@ class MainAgent:
                         "action": action.model_dump(),
                         "error": str(exc),
                     },
+                    process_log=process_log,
                 )
                 remaining = len(plan.actions) - index
                 if remaining:
@@ -930,10 +1080,52 @@ class MainAgent:
     def _is_cancel(text: str) -> bool:
         return text.strip().lower() in CANCEL_WORDS
 
-    def _audit(self, event_type: str, payload: dict) -> None:
+    def _finalize_turn(
+        self,
+        result: CommandResult,
+        *,
+        user_key: str,
+        user_text: str,
+        user_timestamp: datetime,
+        process_log: list[dict[str, Any]],
+    ) -> CommandResult:
+        self._audit(
+            "final_response",
+            {
+                "ok": result.ok,
+                "message": result.message,
+                "data": result.data,
+            },
+            process_log=process_log,
+        )
         if not self._audit_logger:
-            return
+            return result
         try:
-            self._audit_logger.write(event_type, payload)
+            self._audit_logger.write_turn(
+                user_key=user_key,
+                user_text=user_text,
+                chatbot_text=result.message,
+                actions=process_log,
+                user_timestamp=user_timestamp,
+            )
         except OSError:
             pass
+        return result
+
+    @staticmethod
+    def _process_log_record(event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "action_type": event_type,
+            "timestamp": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S"),
+            **payload,
+        }
+
+    def _audit(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+        process_log: list[dict[str, Any]] | None = None,
+    ) -> None:
+        if process_log is None:
+            return
+        process_log.append(self._process_log_record(event_type, payload))
