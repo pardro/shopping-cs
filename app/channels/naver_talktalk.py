@@ -1,5 +1,6 @@
 import base64
 import time
+from datetime import date, timedelta
 from typing import Any
 
 import bcrypt
@@ -22,6 +23,8 @@ class NaverTalkTalkClient(ApiChannelClient):
         self._token_type = settings.naver_token_type
         self._token_path = settings.naver_oauth_token_path
         self._list_path = settings.naver_list_conversations_path
+        self._inquiry_search_days = settings.naver_inquiry_search_days
+        self._order_detail_path = settings.naver_order_detail_path
         self._send_path = settings.naver_send_message_path
         self._status_path = settings.naver_update_status_path
         self._access_token: str | None = None
@@ -79,11 +82,14 @@ class NaverTalkTalkClient(ApiChannelClient):
         return template.format(channel_id=self._channel_id, conversation_id=conversation_id or "")
 
     async def list_conversations(self, status: TicketStatus | None = None) -> list[Conversation]:
+        params: dict[str, Any] = self._inquiry_search_params()
+        if status:
+            params["status"] = status.value
         payload = await self._request(
             "GET",
             self._path(self._list_path),
             headers=await self._headers(),
-            params={"status": status.value} if status else None,
+            params=params,
         )
         items = (
             payload.get("contents")
@@ -105,6 +111,29 @@ class NaverTalkTalkClient(ApiChannelClient):
             for item in items
             if isinstance(item, dict)
         ]
+
+    def _inquiry_search_params(self) -> dict[str, str]:
+        end_date = date.today()
+        days = max(self._inquiry_search_days, 1)
+        start_date = end_date - timedelta(days=days)
+        return {
+            "startSearchDate": start_date.isoformat(),
+            "endSearchDate": end_date.isoformat(),
+        }
+
+    async def get_order_details(self, product_order_ids: list[str]) -> dict[str, Any]:
+        if not product_order_ids:
+            return {}
+        payload = await self._request(
+            "POST",
+            self._order_detail_path,
+            headers=await self._headers(),
+            json={
+                "productOrderIds": product_order_ids[:30],
+                "quantityClaimCompatibility": True,
+            },
+        )
+        return payload
 
     async def send_message(self, conversation_id: str, text: str) -> dict[str, Any]:
         return await self._request(

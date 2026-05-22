@@ -1,3 +1,5 @@
+from typing import Any
+
 from app.agents.draft_reply_agent import DraftReplyAgent
 from app.channels.base import ChannelClient
 from app.models import ChannelName, Conversation, DraftReply, TicketStatus
@@ -29,6 +31,12 @@ class ChannelCsAgent:
     async def send_reply(self, conversation_id: str, text: str) -> None:
         await self._client.send_message(conversation_id, text)
         self._repository.record_outbound_message(self.channel, conversation_id, text)
+
+    async def get_order_details(self, product_order_ids: list[str]) -> dict[str, Any]:
+        get_order_details = getattr(self._client, "get_order_details", None)
+        if not get_order_details:
+            return {}
+        return await get_order_details(product_order_ids)
 
     async def close(self, conversation_id: str) -> None:
         await self._client.update_status(conversation_id, TicketStatus.CLOSED)

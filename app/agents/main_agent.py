@@ -1,4 +1,7 @@
+import re
 from collections.abc import Mapping
+from datetime import datetime
+from typing import Any
 
 from app.agents.draft_reply_agent import DraftReplyAgent
 from app.agents.sub_agent import ChannelCsAgent
@@ -148,6 +151,9 @@ class MainAgent:
         return result
 
     async def _execute_plan(self, plan: ExecutionPlan, user_key: str) -> CommandResult:
+        if any(action.type == ActionType.ORDER_LOOKUP for action in plan.actions):
+            return await self._execute_order_lookup_plan(plan, user_key)
+
         results: list[str] = []
         ok = True
         for index, action in enumerate(plan.actions, start=1):
@@ -187,6 +193,77 @@ class MainAgent:
             data={"plan": plan.model_dump(), "results": results},
         )
 
+    async def _execute_order_lookup_plan(
+        self,
+        plan: ExecutionPlan,
+        user_key: str,
+    ) -> CommandResult:
+        result_lines: list[str] = []
+        content_blocks: list[str] = []
+        raw_results: list[str] = []
+        ok = True
+
+        for index, action in enumerate(plan.actions, start=1):
+            try:
+                result = await self._execute_action(action, user_key)
+                raw_results.append(f"{index}. 완료 - {result}")
+                if action.type == ActionType.SYNC:
+                    result_lines.extend(self._format_sync_result_lines(result))
+                elif action.type == ActionType.ORDER_LOOKUP:
+                    if content_blocks:
+                        content_blocks.append("---")
+                    content_blocks.append(result)
+                else:
+                    result_lines.append(f"{self._describe_action(action)} 성공")
+                self._audit(
+                    "action_executed",
+                    {
+                        "user_key": user_key,
+                        "action": action.model_dump(),
+                        "result": result,
+                    },
+                )
+            except Exception as exc:
+                ok = False
+                failure = f"{index}. 실패 - {self._describe_action(action)}: {exc}"
+                raw_results.append(failure)
+                result_lines.append(failure)
+                self._audit(
+                    "action_failed",
+                    {
+                        "user_key": user_key,
+                        "action": action.model_dump(),
+                        "error": str(exc),
+                    },
+                )
+                remaining = len(plan.actions) - index
+                if remaining:
+                    result_lines.append(f"남은 {remaining}개 작업은 실행하지 않았습니다.")
+                break
+
+        message_parts = ["# 실행 결과", *result_lines]
+        if content_blocks:
+            message_parts.extend(["", "# 내용", *content_blocks])
+        return CommandResult(
+            ok=ok,
+            message="\n".join(message_parts),
+            data={"plan": plan.model_dump(), "results": raw_results},
+        )
+
+    @staticmethod
+    def _format_sync_result_lines(result: str) -> list[str]:
+        lines: list[str] = []
+        for part in result.split(","):
+            normalized = part.strip()
+            if not normalized:
+                continue
+            if "건 동기화" in normalized:
+                channel, count = normalized.split(" ", 1)
+                lines.append(f"{channel} 동기화 성공 : {count.replace(' 동기화', '')}")
+            else:
+                lines.append(f"{normalized} 성공")
+        return lines
+
     async def _execute_action(self, action: PlannedAction, user_key: str) -> str:
         if action.type == ActionType.SYNC:
             synced: dict[str, int] = {}
@@ -214,6 +291,9 @@ class MainAgent:
             self._set_active_conversation(user_key, channel, conversation_id)
             history = DraftReplyAgent.format_conversation_history(conversation)
             return f"{channel.value} #{conversation_id} 이전 대화 기록\n{history}"
+
+        if action.type == ActionType.ORDER_LOOKUP:
+            return await self._order_lookup_text(channel, conversation_id, user_key)
 
         if action.type == ActionType.DRAFT_REPLY:
             conversation = self._repository.get_conversation(channel, conversation_id)
@@ -276,6 +356,214 @@ class MainAgent:
             )
         return "\n".join(lines)
 
+    async def _order_lookup_text(
+        self,
+        channel: ChannelName,
+        conversation_id: str,
+        user_key: str,
+    ) -> str:
+        conversation = self._repository.get_conversation(channel, conversation_id)
+        if not conversation:
+            raise ValueError(
+                f"{channel.value} conversation '{conversation_id}' was not found. "
+                "먼저 채널 동기화를 요청해주세요."
+            )
+        self._set_active_conversation(user_key, channel, conversation_id)
+        order_details = await self._load_order_details(channel, conversation)
+        latest_message = self._latest_message_text(conversation)
+        order_summary = self._format_order_summary(conversation.raw, order_details)
+        order_status = self._format_order_status(conversation.raw, order_details)
+        timestamp = self._conversation_display_time(conversation)
+        channel_label = channel.value.upper()
+        return "\n".join(
+            [
+                f"[1] {channel_label} #{conversation_id}",
+                f"{timestamp} | {order_status}",
+                "",
+                "문의",
+                latest_message,
+                "",
+                "주문",
+                order_summary,
+            ]
+        )
+
+    async def _load_order_details(
+        self,
+        channel: ChannelName,
+        conversation,
+    ) -> list[dict[str, Any]]:
+        product_order_ids = self._product_order_ids(conversation.raw)
+        if not product_order_ids:
+            return []
+        agent = self._sub_agents[channel]
+        try:
+            payload = await agent.get_order_details(product_order_ids)
+        except Exception as exc:
+            return [{"orderLookupError": str(exc)}]
+        return self._order_detail_items(payload)
+
+    @staticmethod
+    def _product_order_ids(raw: dict[str, Any]) -> list[str]:
+        value = (
+            raw.get("productOrderIdList")
+            or raw.get("productOrderIds")
+            or raw.get("product_order_ids")
+            or raw.get("productOrderId")
+        )
+        if not value:
+            return []
+        if isinstance(value, str):
+            return [item.strip() for item in value.split(",") if item.strip()]
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()]
+        return [str(value).strip()]
+
+    @staticmethod
+    def _order_detail_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
+        data = payload.get("data", payload)
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+        if not isinstance(data, dict):
+            return []
+        contents = data.get("contents") or data.get("productOrders") or data.get("orders")
+        if isinstance(contents, list):
+            return [item for item in contents if isinstance(item, dict)]
+        if "productOrder" in data or "order" in data:
+            return [data]
+        return []
+
+    def _format_order_summary(
+        self,
+        raw: dict[str, Any],
+        details: list[dict[str, Any]],
+    ) -> str:
+        if details:
+            summaries = []
+            for detail in details:
+                if detail.get("orderLookupError"):
+                    continue
+                product_order = detail.get("productOrder") or detail
+                order = detail.get("order") or {}
+                product_name = (
+                    product_order.get("productName")
+                    or raw.get("productName")
+                    or "상품명 미확인"
+                )
+                option = self._format_order_option(
+                    product_order.get("productOption") or raw.get("productOrderOption")
+                )
+                quantity = product_order.get("quantity")
+                order_id = (
+                    order.get("orderId")
+                    or product_order.get("orderId")
+                    or raw.get("orderId")
+                )
+                parts = [str(product_name)]
+                if option:
+                    parts.append(f"- 옵션: {option}")
+                if quantity:
+                    parts.append(f"- 수량: {self._format_order_quantity(quantity)}")
+                if order_id:
+                    parts.append(f"- 주문번호: {order_id}")
+                summaries.append("\n".join(parts))
+            if summaries:
+                return "\n\n".join(summaries)
+
+        product_name = raw.get("productName") or "상품명 미확인"
+        option = self._format_order_option(raw.get("productOrderOption"))
+        quantity = (
+            raw.get("quantity")
+            or raw.get("orderQuantity")
+            or raw.get("productOrderQuantity")
+        )
+        order_id = raw.get("orderId")
+        product_order_ids = raw.get("productOrderIdList")
+        parts = [str(product_name)]
+        if option:
+            parts.append(f"- 옵션: {option}")
+        if quantity:
+            parts.append(f"- 수량: {self._format_order_quantity(quantity)}")
+        if order_id:
+            parts.append(f"- 주문번호: {order_id}")
+        if product_order_ids:
+            parts.append(f"- 상품주문번호: {product_order_ids}")
+        return "\n".join(parts)
+
+    @staticmethod
+    def _format_order_option(option: Any) -> str:
+        if not option:
+            return ""
+        values: list[str] = []
+        for raw_part in str(option).split("/"):
+            part = raw_part.strip()
+            if not part:
+                continue
+            if ":" in part:
+                part = part.split(":", 1)[1].strip()
+            part = re.sub(r"^\(([^)]+)\)\s*", r"\1 ", part).strip()
+            values.append(part)
+        return " / ".join(values)
+
+    @staticmethod
+    def _format_order_quantity(quantity: Any) -> str:
+        text = str(quantity).strip()
+        if not text:
+            return ""
+        return text if text.endswith("개") else f"{text}개"
+
+    @staticmethod
+    def _format_order_status(raw: dict[str, Any], details: list[dict[str, Any]]) -> str:
+        statuses = []
+        for detail in details:
+            if detail.get("orderLookupError"):
+                statuses.append(f"주문 상세 조회 실패: {detail['orderLookupError']}")
+                continue
+            product_order = detail.get("productOrder") or detail
+            claim = detail.get("claim") or {}
+            delivery = detail.get("delivery") or {}
+            status = (
+                product_order.get("productOrderStatus")
+                or product_order.get("placeOrderStatus")
+                or claim.get("claimStatus")
+                or delivery.get("deliveryStatus")
+            )
+            if status:
+                statuses.append(str(status))
+        if statuses:
+            return ", ".join(dict.fromkeys(statuses))
+        return str(
+            raw.get("productOrderStatus")
+            or raw.get("claimStatus")
+            or raw.get("deliveryStatus")
+            or "상태 미확인"
+        )
+
+    @staticmethod
+    def _latest_message_text(conversation) -> str:
+        if not conversation.messages:
+            return "저장된 대화 없음"
+        return conversation.messages[-1].text[:120]
+
+    @staticmethod
+    def _conversation_display_time(conversation) -> str:
+        raw_time = (
+            conversation.raw.get("inquiryRegistrationDateTime")
+            or conversation.raw.get("created_at")
+            or conversation.raw.get("createdAt")
+        )
+        parsed: datetime | None = None
+        if raw_time:
+            try:
+                parsed = datetime.fromisoformat(str(raw_time).replace("Z", "+00:00"))
+            except ValueError:
+                parsed = None
+        if not parsed and conversation.messages:
+            parsed = conversation.messages[-1].created_at
+        if not parsed:
+            parsed = datetime.now().astimezone()
+        return parsed.astimezone().strftime("%y-%m-%d %H:%M")
+
     def _format_plan_for_approval(self, plan: ExecutionPlan) -> str:
         lines = [
             "요청을 분석했습니다.",
@@ -306,6 +594,8 @@ class MainAgent:
             return "CS 현황 요약"
         if action.type == ActionType.CONVERSATION_DETAIL:
             return f"{channel}{target} 이전 대화 기록 조회"
+        if action.type == ActionType.ORDER_LOOKUP:
+            return f"{channel}{target} 주문내역 조회"
         if action.type == ActionType.DRAFT_REPLY:
             return f"{channel}{target} 답변 초안 생성"
         if action.type == ActionType.SEND_REPLY:
@@ -336,24 +626,32 @@ class MainAgent:
             "You are a Korean shopping mall CS assistant planner. "
             "Analyze the user's natural language request and create a safe execution plan. "
             "Do not execute anything. Return only structured data matching the schema. "
-            "Available actions are: sync, summary, conversation_detail, draft_reply, "
-            "send_reply, close_ticket. "
+            "Available actions are: sync, summary, conversation_detail, order_lookup, "
+            "draft_reply, send_reply, close_ticket. "
             "Use channel values only when known: kakao or naver. "
             "Prefer freshness over minimizing API calls. It is acceptable to sync before "
             "reading, summarizing, or drafting from conversations. "
             "If the user asks to list unresolved/open inquiries by channel, use summary. "
             "If the user asks about the details, context, or previous conversation of a "
             "specific inquiry without asking for a reply draft, use conversation_detail. "
-            "If the user asks to sync and then list or summarize, create sync first and summary second. "
+            "If the user asks to check order history, order details, order status, "
+            "배송 상태, 주문 상태, 주문내역, use order_lookup. "
+            "If the user asks to sync and then list or summarize, create sync first "
+            "and summary second. "
             "If the user says '초안', use draft_reply, not send_reply. "
             "If the user says '보내줘' or clearly asks to send to the customer, use send_reply. "
-            "If the user references a numbered inquiry such as '카카오 1번', resolve it using the provided ticket mapping. "
+            "If the user references a numbered inquiry such as '카카오 1번', "
+            "resolve it using the provided ticket mapping. "
             "For send_reply and close_ticket, channel and conversation_id are required. "
+            "For order_lookup, channel and conversation_id are required. "
             "For draft_reply, put any requested answer direction or quoted content in message. "
-            "For send_reply, message is required and must be exactly what should be sent to the customer. "
-            "If required information is missing, set needs_more_info=true and ask a concise Korean question. "
+            "For send_reply, message is required and must be exactly what should be "
+            "sent to the customer. "
+            "If required information is missing, set needs_more_info=true and ask "
+            "a concise Korean question. "
             "For risky customer-facing actions, add a risk note. "
-            "Only send_reply actions require later approval. Other actions will be executed immediately. "
+            "Only send_reply actions require later approval. Other actions will be "
+            "executed immediately. "
             "Never mark actions as already done in the plan."
         )
 
@@ -408,7 +706,11 @@ class MainAgent:
                 prepared_api="GET kakao/naver 대화 목록 API",
             )
 
-        if action.type in {ActionType.CONVERSATION_DETAIL, ActionType.DRAFT_REPLY}:
+        if action.type in {
+            ActionType.CONVERSATION_DETAIL,
+            ActionType.ORDER_LOOKUP,
+            ActionType.DRAFT_REPLY,
+        }:
             if not action.channel or synced_all or action.channel in synced_channels:
                 return None
             return PlannedAction(
@@ -461,13 +763,23 @@ class MainAgent:
         conversation_id = action.conversation_id
         if not action.channel or not conversation_id:
             return conversation_id
-        number = conversation_id.strip().replace("번", "")
+        normalized_id = self._normalize_conversation_id(conversation_id)
+        number = normalized_id.replace("번", "")
         if not number.isdigit():
-            return conversation_id
+            return normalized_id
         context = self._repository.get_user_context(user_key)
         mapping = context.get("last_open_ticket_mapping", {})
         channel_mapping = mapping.get(action.channel.value, {})
-        return channel_mapping.get(number, conversation_id)
+        return channel_mapping.get(number, normalized_id)
+
+    @staticmethod
+    def _normalize_conversation_id(conversation_id: str) -> str:
+        normalized = str(conversation_id).strip().strip("`'\"")
+        while normalized.startswith("#"):
+            normalized = normalized[1:].strip()
+        if normalized.endswith("번"):
+            normalized = normalized[:-1].strip()
+        return normalized
 
     @staticmethod
     def _prepared_api_text(action: PlannedAction) -> str:
@@ -479,6 +791,8 @@ class MainAgent:
             return "로컬 DB 미처리 문의 조회"
         if action.type == ActionType.CONVERSATION_DETAIL:
             return f"로컬 DB 전체 이전 대화 기록 조회, 대상 {channel} #{conversation_id}"
+        if action.type == ActionType.ORDER_LOOKUP:
+            return f"로컬 DB 문의 정보와 채널 주문 상세 API 조회, 대상 {channel} #{conversation_id}"
         if action.type == ActionType.DRAFT_REPLY:
             return (
                 "로컬 DB 전체 이전 대화 기록 조회 후 "
@@ -499,7 +813,10 @@ class MainAgent:
         for channel, items in mapping.items():
             if not items:
                 continue
-            pairs = ", ".join(f"{number}번 -> {conversation_id}" for number, conversation_id in items.items())
+            pairs = ", ".join(
+                f"{number}번 -> {conversation_id}"
+                for number, conversation_id in items.items()
+            )
             lines.append(f"{channel}: {pairs}")
         return "\n".join(lines) if lines else "저장된 번호표 없음"
 
@@ -508,7 +825,10 @@ class MainAgent:
         if not tickets:
             return "open 티켓 없음"
         return "\n".join(
-            f"- {ticket.channel.value} #{ticket.conversation_id} {ticket.customer_name or ''}".rstrip()
+            (
+                f"- {ticket.channel.value} #{ticket.conversation_id} "
+                f"{ticket.customer_name or ''}"
+            ).rstrip()
             for ticket in tickets
         )
 
@@ -584,7 +904,7 @@ class MainAgent:
     def _require_conversation_id(action: PlannedAction) -> str:
         if not action.conversation_id:
             raise ValueError("대화 ID가 필요합니다")
-        return action.conversation_id
+        return MainAgent._normalize_conversation_id(action.conversation_id)
 
     @staticmethod
     def _is_approval(text: str) -> bool:

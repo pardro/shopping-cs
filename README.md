@@ -1,88 +1,62 @@
 # Shopping CS Assistant
 
-카카오톡 비즈니스센터와 스마트스토어 톡톡 문의를 통합 관리하는 대화형 쇼핑몰 CS 비서입니다.
-운영자는 Telegram에서 자연어로 요청하고, 메인 에이전트는 ChatGPT로 요청을 분석해 실행 계획을
-만든 뒤 조회/동기화/초안/상담 종료 작업은 바로 수행합니다. 고객에게 특정 메시지를 전송하는 작업만
-운영자 승인 후 수행합니다.
+카카오톡 비즈니스 채널, 네이버 스마트스토어 고객 문의, Telegram 운영자 채팅을 묶어 관리하는 CS 보조 에이전트입니다.
 
-## 핵심 동작
+운영자는 Telegram 또는 HTTP API로 자연어 요청을 보내고, 메인 에이전트가 필요한 API 호출 계획을 만든 뒤 실행합니다. 고객에게 실제 답변을 보내는 작업만 운영자 승인을 요구하며, 조회/동기화/초안 생성/주문 조회 같은 작업은 바로 실행됩니다.
 
-1. 운영자가 Telegram으로 자연어 요청을 보냅니다.
+## 주요 기능
+
+- macOS, Linux, Windows PowerShell에서 실행 가능
+- Telegram Bot long polling 지원
+- HTTP `/commands` API로 로컬 테스트 가능
+- OpenAI 기반 메인 에이전트가 자연어 요청을 실행 계획으로 변환
+- 채널별 서브 에이전트가 동기화, 답변 초안, 전송, 상담 종료 처리
+- 답변 초안 전용 서브 에이전트가 이전 대화 전체를 기반으로 초안 생성
+- 문의 상세 또는 초안 요청 시 해당 문의의 이전 대화 기록 전체 출력
+- 주문내역 조회 시 고객 주문 내역, 옵션, 수량, 주문번호, 주문 상태 출력
+- 고객에게 특정 메시지를 보내는 `send_reply` 작업만 승인 필요
+- 사용자의 요청, 실행 계획, 실행 결과를 날짜별 JSONL 감사 로그로 저장
+- 날짜가 바뀌면 새 감사 로그 파일 생성
+- `.gitignore`로 `.env`, 로그, DB, 가상환경 파일 제외
+
+## 동작 흐름
+
+1. 운영자가 Telegram 또는 HTTP API로 요청합니다.
 2. 메인 에이전트가 요청을 분석해 실행 계획을 만듭니다.
-3. 각 계획은 실제 수행 가능한 API 작업 형태로 준비됩니다.
-4. 최신 데이터가 필요한 조회/요약/초안 작업 앞에는 채널 동기화를 자동으로 추가합니다.
-5. 고객에게 메시지를 전송하지 않는 작업은 즉시 실행합니다.
-6. 고객에게 특정 메시지를 전송하는 작업은 계획, 이유, 준비된 API 작업, 주의 사항을 운영자에게 보여줍니다.
-7. 운영자가 직전에 다루던 상담과 다른 맥락의 요청을 하면 직전 상담은 자동으로 종료 처리합니다.
-8. 운영자가 `승인` 또는 `실행`이라고 답하면 전송 작업을 수행합니다.
-9. 운영자가 `취소`라고 답하면 대기 중인 전송 계획을 폐기합니다.
+3. 최신 데이터가 필요한 조회 작업은 먼저 채널 동기화를 수행합니다.
+4. 고객에게 메시지를 보내지 않는 작업은 즉시 실행됩니다.
+5. 고객에게 특정 답변을 보내는 작업은 실행 계획, 사유, 호출 예정 API를 보여준 뒤 승인 대기합니다.
+6. 운영자가 `승인` 또는 `실행`이라고 답하면 고객 메시지를 전송합니다.
+7. 운영자가 `취소`라고 답하면 승인 대기 중인 계획을 버립니다.
+8. 직전 상담과 다른 맥락의 요청이면 현재 상담 종료 API를 자동으로 호출하도록 계획을 보강합니다.
 
-고객에게 메시지를 보내는 작업만 항상 승인 후 실행됩니다.
+상담 종료 API는 채널별 종료 path가 설정된 경우에만 실제 외부 API를 호출합니다. path가 비어 있으면 로컬 상태만 정리하거나 skip 결과를 반환합니다.
 
-## 서비스 구조
+## 프로젝트 구조
 
-- `app/main.py`: FastAPI 앱 진입점
-- `app/api.py`: 헬스 체크, 대화 요청 API, 채널 웹훅 API
+- `app/main.py`: FastAPI 애플리케이션 진입점
+- `app/api.py`: 헬스 체크, 명령 API, 채널 웹훅 API
 - `app/telegram_bot.py`: Telegram Bot API long polling 워커
-- `app/agents/main_agent.py`: 자연어 분석, 즉시 실행, 전송 승인 대기, 순차 실행
-- `app/agents/sub_agent.py`: 채널별 CS 처리 서브 에이전트
-- `app/channels/kakao.py`: 카카오톡 비즈니스센터 API 클라이언트
-- `app/channels/naver_talktalk.py`: 스마트스토어 톡톡 API 클라이언트
-- `app/llm.py`: OpenAI ChatGPT 호출 계층
-- `app/storage/repository.py`: SQLite 티켓, 전송 승인 대기 계획, 대화 컨텍스트 저장소
+- `app/agents/main_agent.py`: 자연어 분석, 실행 계획 생성, 승인 플로우, 주문 조회 포맷
+- `app/agents/sub_agent.py`: 채널별 CS 처리 공통 서브 에이전트
+- `app/agents/draft_reply_agent.py`: 답변 초안 생성 전용 서브 에이전트
+- `app/channels/kakao.py`: Kakao 채널 API 클라이언트
+- `app/channels/naver_talktalk.py`: Naver Commerce API 클라이언트
+- `app/storage/repository.py`: SQLite 저장소, 사용자 컨텍스트, 승인 대기 계획
+- `app/audit.py`: 날짜별 감사 로그 기록
+- `app/check_apis.py`: `.env` 값 기반 외부 API 연결 점검
 
-## 지원 작업
+## 지원 액션
 
-메인 에이전트는 자연어 요청을 아래 작업으로 변환합니다.
-
-- `sync`: 카카오/네이버 채널 API에서 최신 대화 동기화
-- `summary`: 채널별 미처리 문의 목록 정리
-- `conversation_detail`: 특정 문의의 전체 이전 대화 기록 조회
-- `draft_reply`: 고객 답변 초안 생성
-- `send_reply`: 고객에게 답변 전송
+- `sync`: Kakao/Naver 채널에서 최신 문의를 동기화
+- `summary`: 채널별 미처리 문의 목록과 번호표 출력
+- `conversation_detail`: 특정 문의의 이전 대화 전체 조회
+- `order_lookup`: 특정 문의의 주문내역, 옵션, 수량, 주문번호, 주문 상태 조회
+- `draft_reply`: 이전 대화 전체를 기반으로 답변 초안 생성
+- `send_reply`: 고객에게 답변 전송, 반드시 운영자 승인 필요
 - `close_ticket`: 상담 종료 처리
 
-예를 들어 “카카오랑 네이버 문의를 동기화하고 미처리 건을 정리해줘”는 `sync -> summary`
-순서의 계획으로 만들어집니다.
-
-## 대화 예시
-
-운영자:
-
-```text
-각 채널별로 미처리 문의 내역 정리해서 나열해 줘
-```
-
-메인 에이전트:
-
-```text
-실행 결과
-1. 완료 - 채널별 CS 현황
-- kakao: open 2, pending 0, closed 0
-- naver: open 1, pending 0, closed 0
-
-미처리 문의 목록
-
-kakao
-1. #kakao-test-001 홍길동 - 배송은 언제 출발하나요?
-2. #kakao-test-002 이고객 - 옵션 변경 가능한가요?
-
-naver
-1. #naver-test-001 김고객 - 교환 접수 가능한가요?
-```
-
-이후 번호를 그대로 참조할 수 있습니다.
-
-운영자:
-
-```text
-카카오 1번 문의건에 대해서 "오늘 출고 예정이며 송장 등록 후 다시 안내드리겠습니다"라는 답변 내용으로 초안 만들어 줘
-```
-
-메인 에이전트는 직전에 보여준 번호표를 이용해 `카카오 1번`을 `kakao-test-001`로 해석하고,
-전체 이전 대화 기록을 함께 보여준 뒤, 그 기록을 기반으로 답변 초안을 바로 생성합니다.
-
-## 실행 준비
+## 설치
 
 Python 3.11 이상을 사용합니다.
 
@@ -106,9 +80,15 @@ python -m pip install -e .
 Copy-Item .env.example .env
 ```
 
-가상환경은 운영체제마다 실행 파일 구조가 다르므로 저장소에 커밋하지 말고 각 환경에서 새로 만듭니다.
+Windows에서 `Activate.ps1` 실행이 막히면 현재 PowerShell 세션에서 아래 명령을 먼저 실행합니다.
 
-`.env`에 API 키와 파라미터를 입력합니다. 모든 키는 프로젝트 최상단 `.env`에서만 관리합니다.
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+```
+
+## 환경 변수
+
+`.env.example`을 복사해 `.env`를 만들고 필요한 값을 채웁니다. `.env`는 `.gitignore`에 포함되어 있으므로 저장소에 업로드하지 않습니다.
 
 최소 실행에 필요한 값:
 
@@ -119,26 +99,138 @@ TELEGRAM_BOT_TOKEN=123456:telegram-bot-token
 AUDIT_LOG_DIR=./logs/audit
 ```
 
-채널 API까지 사용하려면 아래 값도 채워야 합니다.
+로컬 앱 설정:
 
 ```env
-KAKAO_API_BASE_URL=https://...
-KAKAO_REST_API_KEY=...
-KAKAO_CHANNEL_ID=...
+APP_ENV=local
+APP_HOST=0.0.0.0
+APP_PORT=8000
+APP_LOG_LEVEL=INFO
+SQLITE_PATH=./shopping_cs.sqlite3
+AUDIT_LOG_DIR=./logs/audit
+```
 
+Telegram:
+
+```env
+TELEGRAM_BOT_TOKEN=123456:telegram-bot-token
+TELEGRAM_ALLOWED_CHAT_IDS=
+TELEGRAM_POLL_TIMEOUT_SECONDS=30
+```
+
+`TELEGRAM_ALLOWED_CHAT_IDS`를 비워두면 모든 chat id를 허용합니다. 운영 환경에서는 운영자 chat id만 쉼표로 구분해 넣는 것을 권장합니다.
+
+## Kakao 설정
+
+```env
+KAKAO_API_BASE_URL=https://api.example-kakao.com
+KAKAO_REST_API_KEY=your-kakao-rest-api-key
+KAKAO_CHANNEL_ID=your-kakao-channel-id
+KAKAO_LIST_CONVERSATIONS_PATH=
+KAKAO_SEND_MESSAGE_PATH=
+KAKAO_UPDATE_STATUS_PATH=
+```
+
+현재 공개 Kakao REST API에는 이 프로젝트가 기대하는 형태의 상담 목록 조회 API가 없습니다. 별도 계약, 비즈니스 센터 제휴 API, 사내 프록시 API가 없다면 아래 값은 비워두면 됩니다.
+
+- `KAKAO_LIST_CONVERSATIONS_PATH`
+- `KAKAO_SEND_MESSAGE_PATH`
+- `KAKAO_UPDATE_STATUS_PATH`
+
+비워둔 경우 `python -m app.check_apis`에서 Kakao는 다음처럼 정상 안내가 나옵니다.
+
+```text
+[OK] kakao: conversation list API is not configured; public Kakao REST API does not provide this endpoint
+```
+
+Kakao 값을 찾는 위치:
+
+- Kakao Developers: 애플리케이션 REST API key
+- Kakao 비즈니스/상담 API 계약 문서: 상담 목록, 메시지 전송, 상태 변경 endpoint
+- 사내에서 제공하는 프록시가 있다면 해당 base URL과 path
+
+## Naver 설정
+
+Naver는 네이버 커머스 API 기준으로 동작합니다.
+
+```env
 NAVER_TALKTALK_API_BASE_URL=https://api.commerce.naver.com/external
-NAVER_CLIENT_ID=...
-NAVER_CLIENT_SECRET=...
+NAVER_CLIENT_ID=your-naver-client-id
+NAVER_CLIENT_SECRET=your-naver-client-secret
+NAVER_TALKTALK_CHANNEL_ID=
 NAVER_ACCOUNT_ID=
 NAVER_TOKEN_TYPE=SELF
 NAVER_OAUTH_TOKEN_PATH=/v1/oauth2/token
 NAVER_LIST_CONVERSATIONS_PATH=/v1/pay-user/inquiries
+NAVER_INQUIRY_SEARCH_DAYS=30
+NAVER_ORDER_DETAIL_PATH=/v1/pay-order/seller/product-orders/query
 NAVER_SEND_MESSAGE_PATH=/v1/pay-merchant/inquiries/{conversation_id}/answer
+NAVER_UPDATE_STATUS_PATH=
 ```
+
+필수 값:
+
+- `NAVER_CLIENT_ID`: 네이버 커머스 API 센터 애플리케이션 Client ID
+- `NAVER_CLIENT_SECRET`: 네이버 커머스 API 센터 애플리케이션 Client Secret
+- `NAVER_TOKEN_TYPE`: 보통 판매자가 직접 만든 애플리케이션이면 `SELF`
+
+상황에 따라 필요한 값:
+
+- `NAVER_ACCOUNT_ID`: `NAVER_TOKEN_TYPE=SELLER`일 때만 필요합니다.
+- `NAVER_TALKTALK_CHANNEL_ID`: 현재 커머스 문의 API path에는 직접 쓰지 않지만, 별도 톡톡 API 또는 프록시 path가 `{channel_id}`를 요구하면 채웁니다.
+- `NAVER_UPDATE_STATUS_PATH`: 상담 종료 API endpoint를 확보한 경우에만 채웁니다. 비워두면 종료 API 호출은 skip됩니다.
+
+기본 path:
+
+- 토큰 발급: `/v1/oauth2/token`
+- 고객 문의 조회: `/v1/pay-user/inquiries`
+- 주문 상세 조회: `/v1/pay-order/seller/product-orders/query`
+- 답변 등록: `/v1/pay-merchant/inquiries/{conversation_id}/answer`
+
+문의 조회 API는 `startSearchDate`, `endSearchDate`가 필수입니다. 이 프로젝트는 `NAVER_INQUIRY_SEARCH_DAYS` 기준으로 최근 N일 범위를 자동으로 넣습니다.
+
+Naver 값을 찾는 위치:
+
+- 네이버 커머스 API 센터: 애플리케이션 Client ID, Client Secret
+- API 센터 문서: 고객 문의 조회, 답변 등록, 상품 주문 상세 조회 endpoint
+- 판매자 계정/애플리케이션 권한 화면: 문의/주문 조회 권한 승인 여부
+
+## API 연결 점검
+
+`.env` 값을 채운 뒤 아래 명령으로 API 연결을 점검합니다.
+
+```bash
+python -m app.check_apis
+```
+
+점검 항목:
+
+- OpenAI: 설정한 모델 조회 가능 여부
+- Telegram: Bot API `getMe` 가능 여부
+- Kakao: 상담 목록 path 설정 여부 또는 목록 API 호출 가능 여부
+- Naver: OAuth 토큰 발급 후 문의 목록 조회 가능 여부
+
+예상 출력:
+
+```text
+[OK] openai: model reachable: gpt-4o-mini
+[OK] telegram: bot reachable: @your_bot
+[OK] kakao: conversation list API is not configured; public Kakao REST API does not provide this endpoint
+[OK] naver: list conversations reachable: 3 items
+```
+
+자주 보는 오류:
+
+- Naver `type 항목이 유효하지 않습니다`: `NAVER_TOKEN_TYPE`을 `SELF` 또는 `SELLER` 대문자로 설정합니다.
+- Naver `403 Forbidden`: Client ID/Secret, 애플리케이션 권한, 판매자 계정 권한을 확인합니다.
+- Naver `startSearchDate/endSearchDate null`: `NAVER_LIST_CONVERSATIONS_PATH`가 `/v1/pay-user/inquiries`인지 확인하고 최신 코드에서 실행합니다.
+- Kakao `404 Not Found`: 공개 Kakao REST API에는 상담 목록 endpoint가 없으므로, 별도 계약 endpoint가 없다면 Kakao path를 비워둡니다.
+
+`check_apis`는 read-only 성격의 확인만 수행합니다. 고객 메시지 전송이나 상담 종료 같은 변경 작업은 실행하지 않습니다.
 
 ## 서버 실행
 
-터미널 1에서 API 서버를 실행합니다.
+터미널 1에서 FastAPI 서버를 실행합니다.
 
 ```bash
 uvicorn app.main:app --host 0.0.0.0 --port 8000
@@ -150,7 +242,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 curl http://localhost:8000/health
 ```
 
-예상 응답:
+응답:
 
 ```json
 {"status":"ok"}
@@ -162,94 +254,126 @@ curl http://localhost:8000/health
 python -m app.telegram_bot
 ```
 
-## API 설정 점검
+코드를 수정한 뒤에는 Telegram 워커를 재시작해야 변경 사항이 반영됩니다.
 
-`.env`에 입력한 값으로 외부 API가 read-only 요청에 응답하는지 확인할 수 있습니다.
-민감한 토큰 값은 출력하지 않습니다.
-
-```bash
-python -m app.check_apis
-```
-
-이 명령은 OpenAI 모델 조회, Telegram `getMe`, Kakao/Naver 대화 목록 조회를 수행합니다.
-메시지 전송이나 상담 종료 같은 변경 작업은 실행하지 않습니다.
-
-## 감사 로그
-
-사용자 요청, 전송 승인 요청, 실행 성공/실패 내역은 `AUDIT_LOG_DIR` 폴더에 날짜별 JSONL 파일로 기록됩니다.
-기본 경로는 `./logs/audit/YYYY-MM-DD.jsonl`입니다. 날짜가 바뀌면 새 파일에 기록됩니다.
-
-## Telegram 사용법
-
-Telegram에서 BotFather로 만든 봇에게 자연어로 요청합니다.
-
-도움말:
-
-```text
-/help
-```
+## Telegram 사용 예시
 
 미처리 문의 목록:
 
 ```text
-각 채널별로 미처리 문의 내역 정리해서 나열해 줘
+각 채널별로 미처리 문의 내역 정리해서 보여줘
 ```
 
-동기화 후 목록 확인:
+최신 동기화 후 목록 확인:
 
 ```text
-카카오랑 네이버 문의 최신으로 동기화하고 미처리 건 정리해줘
+네이버 미처리 문의건 확인해줘
 ```
 
-번호로 답변 초안 요청:
+특정 문의 상세 확인:
 
 ```text
-카카오 1번 문의건에 대해서 "오늘 출고 예정이며 송장 등록 후 다시 안내드리겠습니다"라는 답변 내용으로 초안 만들어 줘
+네이버 1번 문의 내용 알려줘
 ```
 
-직접 답변 전송 요청:
+이전 대화 기반 답변 초안:
 
 ```text
-네이버 1번 고객에게 "안녕하세요. 교환 접수 가능하며 접수 방법을 안내드리겠습니다."라고 보내줘
+네이버 1번 문의에 대해 교환 가능 여부 답변 초안 만들어줘
 ```
 
-상담 종료 요청:
+주문내역 조회:
 
 ```text
-카카오 1번 상담 종료 처리해줘
+각 문의건들 주문내역 조회해줘
 ```
 
-답변 전송 승인:
+고객에게 답변 전송 요청:
+
+```text
+네이버 1번 고객에게 "안녕하세요. 교환 접수 가능하며 접수 방법 안내드리겠습니다."라고 보내줘
+```
+
+위 요청은 바로 전송되지 않고 승인 대기 상태가 됩니다. 실제 전송하려면 다음처럼 답합니다.
 
 ```text
 승인
 ```
 
-계획 취소:
+승인 대기 중인 계획을 버리려면 다음처럼 답합니다.
 
 ```text
 취소
 ```
 
-## HTTP API로 테스트
+## 모바일 출력 포맷
 
-Telegram 없이도 `/commands` API로 같은 흐름을 테스트할 수 있습니다. 같은 대화를 이어가려면
-동일한 `user_key`를 사용합니다.
+Telegram 모바일 화면에서 읽기 쉽도록 결과는 짧은 줄, 섹션 구분, 채널명과 문의 번호를 기준으로 출력합니다.
 
-미처리 문의 목록 조회:
+주문내역 조회 결과 예시:
 
-```bash
-curl -X POST http://localhost:8000/commands \
-  -H "Content-Type: application/json" \
-  -d '{"user_key":"local-test","text":"각 채널별로 미처리 문의 내역 정리해서 나열해 줘"}'
+```text
+# 실행 결과
+naver 동기화 성공 : 3건
+kakao 동기화 성공 : 2건
+
+# 내용
+[1] NAVER #321856067
+26-05-15 20:19 | PAYED
+
+문의
+사용 준비중간 뜨네요
+
+주문
+모이사나이트 테니스 팔찌
+- 옵션: 3mm / L 17.5cm
+- 수량: 1개
+- 주문번호: 2026051286545151
+
+---
+[2] NAVER #321377537
+26-05-02 11:27 | RETURNED
+
+문의
+2mm 15.5cm 팔찌를 3mm 15.5cm로 교환요청했는데 교환제품은 언제 수령가능한가요?
+
+주문
+모이사나이트 테니스 팔찌
+- 옵션: 2mm / S 15.5cm
+- 수량: 1개
+- 주문번호: 2026042473207241
 ```
 
-번호 참조로 초안 생성:
+옵션은 API 원문이 `사이즈 선택: 2mm / 길이 선택: (S)15.5cm`처럼 들어와도 아래처럼 정리해 출력합니다.
+
+```text
+주문
+모이사나이트 테니스 팔찌
+- 옵션: 2mm / S 15.5cm
+- 수량: 1개
+- 주문번호: 2026042473207241
+```
+
+## HTTP API 테스트
+
+Telegram 없이 `/commands` API로 같은 흐름을 테스트할 수 있습니다.
+
+`user_key`는 대화 컨텍스트를 구분하는 사용자 식별자입니다. 같은 `user_key`를 사용해야 이전 목록의 `1번`, `2번` 같은 번호표, 승인 대기 상태, 현재 상담 컨텍스트가 이어집니다.
+
+미처리 문의 조회:
 
 ```bash
 curl -X POST http://localhost:8000/commands \
   -H "Content-Type: application/json" \
-  -d '{"user_key":"local-test","text":"카카오 1번 문의건에 대해서 오늘 출고 예정이라고 초안 만들어 줘"}'
+  -d '{"user_key":"local-test","text":"각 채널별로 미처리 문의 내역 정리해서 보여줘"}'
+```
+
+번호표를 사용한 주문 조회:
+
+```bash
+curl -X POST http://localhost:8000/commands \
+  -H "Content-Type: application/json" \
+  -d '{"user_key":"local-test","text":"네이버 1번 주문내역 조회해줘"}'
 ```
 
 답변 전송 요청 후 승인:
@@ -257,7 +381,7 @@ curl -X POST http://localhost:8000/commands \
 ```bash
 curl -X POST http://localhost:8000/commands \
   -H "Content-Type: application/json" \
-  -d '{"user_key":"local-test","text":"카카오 1번 고객에게 오늘 출고 예정이라고 보내줘"}'
+  -d '{"user_key":"local-test","text":"네이버 1번 고객에게 오늘 확인 후 안내드리겠다고 보내줘"}'
 
 curl -X POST http://localhost:8000/commands \
   -H "Content-Type: application/json" \
@@ -266,9 +390,9 @@ curl -X POST http://localhost:8000/commands \
 
 ## 채널 웹훅 테스트
 
-실제 카카오/네이버 웹훅을 연결하기 전, 로컬에서 문의 저장 흐름을 테스트할 수 있습니다.
+실제 Kakao/Naver 연동 전에도 로컬 웹훅으로 저장소에 문의를 넣고 흐름을 테스트할 수 있습니다.
 
-카카오 웹훅 예시:
+Kakao 예시:
 
 ```bash
 curl -X POST http://localhost:8000/webhooks/kakao/cs \
@@ -280,7 +404,7 @@ curl -X POST http://localhost:8000/webhooks/kakao/cs \
   }'
 ```
 
-네이버 웹훅 예시:
+Naver 예시:
 
 ```bash
 curl -X POST http://localhost:8000/webhooks/naver/cs \
@@ -292,117 +416,29 @@ curl -X POST http://localhost:8000/webhooks/naver/cs \
   }'
 ```
 
-저장 후 “각 채널별로 미처리 문의 내역 정리해서 나열해 줘”라고 요청하면 번호가 붙은
-미처리 문의 목록으로 표시됩니다.
+## 감사 로그
 
-## 운영 흐름
+사용자 요청, 실행 계획, 승인 대기, 액션 성공/실패 내역은 `AUDIT_LOG_DIR` 아래 날짜별 JSONL 파일로 저장됩니다.
 
-1. API 서버를 실행합니다.
-2. Telegram 워커를 실행합니다.
-3. 운영자가 자연어로 원하는 CS 작업을 요청합니다.
-4. 메인 에이전트가 필요한 경우 최신 대화 동기화를 먼저 수행합니다.
-5. 고객 메시지 전송이 아닌 작업은 바로 실행합니다.
-6. 직전에 다루던 상담과 다른 맥락의 요청이면 직전 상담을 자동 종료합니다.
-7. 고객 메시지 전송 작업은 실행 계획과 준비된 API 작업을 제안합니다.
-8. 운영자가 전송 계획을 검토하고 `승인`합니다.
-9. 실행 결과를 Telegram으로 받습니다.
-10. 후속 요청에서 “카카오 1번”, “네이버 2번”처럼 직전 목록 번호를 참조할 수 있습니다.
+기본 경로:
 
-## API 키 발급
-
-### OpenAI
-
-1. [OpenAI Platform](https://platform.openai.com/)에 로그인합니다.
-2. API keys 화면에서 새 secret key를 생성합니다.
-3. `.env`에 입력합니다.
-
-```env
-OPENAI_API_KEY=sk-...
-OPENAI_MODEL=gpt-4o-mini
-OPENAI_TEMPERATURE=0.2
+```text
+./logs/audit/YYYY-MM-DD.jsonl
 ```
 
-참고:
+날짜가 바뀌면 새 파일에 기록됩니다. `logs/`는 `.gitignore`에 포함되어 저장소에 업로드되지 않습니다.
 
-- [OpenAI API Key Help](https://help.openai.com/en/articles/4936850-where-do-i-find-my-openai-api-key)
-- [OpenAI Quickstart](https://platform.openai.com/docs/quickstart)
+## 보안 및 운영 주의사항
 
-### Telegram
+- `.env`에는 실제 토큰과 secret이 들어가므로 절대 커밋하지 않습니다.
+- `python -m app.check_apis` 출력은 secret 값을 redaction 처리하지만, 공유 전에는 한 번 더 확인합니다.
+- 운영 환경에서는 `TELEGRAM_ALLOWED_CHAT_IDS`를 설정해 허용된 운영자만 봇을 사용할 수 있게 합니다.
+- 고객에게 보내는 메시지는 항상 승인 후 전송됩니다.
+- 조회 작업은 승인 없이 실행되므로, API 권한과 로그 보관 정책을 운영 기준에 맞게 정리합니다.
 
-1. Telegram에서 `@BotFather`와 대화합니다.
-2. `/newbot` 명령으로 봇을 생성합니다.
-3. 발급된 token을 `.env`에 입력합니다.
-4. 운영자만 사용하도록 `TELEGRAM_ALLOWED_CHAT_IDS` 설정을 권장합니다.
+## 참고 링크
 
-```env
-TELEGRAM_BOT_TOKEN=123456:telegram-bot-token
-TELEGRAM_ALLOWED_CHAT_IDS=123456789
-TELEGRAM_POLL_TIMEOUT_SECONDS=30
-```
-
-참고:
-
-- [Telegram Bots](https://core.telegram.org/bots)
-- [BotFather Guide](https://core.telegram.org/bots/features)
-- [Telegram Bot API](https://core.telegram.org/bots/api)
-
-### Kakao
-
-1. [Kakao Developers](https://developers.kakao.com/)에 로그인합니다.
-2. 내 애플리케이션을 생성하거나 기존 비즈니스 앱을 선택합니다.
-3. `[앱] > [플랫폼 키]`에서 REST API key를 확인합니다.
-4. 카카오톡 비즈니스센터의 상담/메시지 API 사용 권한을 확인합니다.
-5. 승인된 API 문서 기준으로 base URL, 채널 ID, path를 `.env`에 입력합니다.
-
-```env
-KAKAO_API_BASE_URL=https://...
-KAKAO_REST_API_KEY=...
-KAKAO_CHANNEL_ID=...
-KAKAO_LIST_CONVERSATIONS_PATH=
-KAKAO_SEND_MESSAGE_PATH=
-KAKAO_UPDATE_STATUS_PATH=
-```
-
-주의:
-
-- Kakao Developers의 REST API key와 카카오톡 비즈니스센터 상담 API 권한은 다를 수 있습니다.
-- 공개 Kakao REST API에는 `/v1/channels/{channel_id}/conversations` 형식의 상담 대화 목록 API가 없습니다.
-- 카카오 상담/메시지 API는 별도 계약 또는 승인 문서의 엔드포인트가 있을 때만 path를 채우세요.
-
-참고:
-
-- [Kakao App Settings](https://developers.kakao.com/docs/latest/en/app-setting/app)
-- [Kakao REST API](https://developers.kakao.com/docs/latest/en/rest-api)
-
-### Naver SmartStore TalkTalk
-
-1. [네이버 커머스API 센터](https://apicenter.commerce.naver.com/)에 접속합니다.
-2. 스마트스토어 판매자 계정으로 로그인합니다.
-3. 애플리케이션을 생성하고 Client ID, Client Secret을 확인합니다.
-4. 문의 API 사용 권한을 확인합니다.
-5. 승인된 API 문서 기준으로 base URL과 path를 `.env`에 입력합니다.
-
-```env
-NAVER_TALKTALK_API_BASE_URL=https://api.commerce.naver.com/external
-NAVER_CLIENT_ID=...
-NAVER_CLIENT_SECRET=...
-NAVER_TALKTALK_CHANNEL_ID=
-NAVER_ACCOUNT_ID=
-NAVER_TOKEN_TYPE=SELF
-NAVER_OAUTH_TOKEN_PATH=/v1/oauth2/token
-NAVER_LIST_CONVERSATIONS_PATH=/v1/pay-user/inquiries
-NAVER_SEND_MESSAGE_PATH=/v1/pay-merchant/inquiries/{conversation_id}/answer
-NAVER_UPDATE_STATUS_PATH=
-```
-
-주의:
-
-- 네이버 커머스API는 OAuth 2.0 Client Credentials 방식으로 인증 토큰을 발급받은 뒤 `Authorization: Bearer` 헤더로 호출합니다.
-- 토큰 발급 시 Client Secret을 직접 보내지 않고 `client_id`, millisecond timestamp, `client_secret`으로 bcrypt 기반 전자서명을 생성합니다.
-- 스마트스토어 판매자가 직접 만든 애플리케이션은 보통 `NAVER_TOKEN_TYPE=SELF`를 사용합니다.
-- 솔루션/대행사가 특정 판매자 계정 권한으로 호출해야 하는 경우에만 `NAVER_TOKEN_TYPE=SELLER`와 판매자 UID인 `NAVER_ACCOUNT_ID`를 사용합니다.
-- 현재 구현은 커머스 API의 고객 문의 조회/답변 등록 엔드포인트 기준입니다. 톡톡 실시간 대화 API가 별도 제휴 권한으로 제공되는 경우, 발급받은 문서의 URL과 path로 교체하세요.
-
-참고:
-
-- [Naver Commerce API](https://apicenter.commerce.naver.com/docs/commerce-api/current)
+- OpenAI Platform: https://platform.openai.com/
+- Telegram Bot API: https://core.telegram.org/bots/api
+- Kakao Developers: https://developers.kakao.com/
+- Naver Commerce API Center: https://apicenter.commerce.naver.com/

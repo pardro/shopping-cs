@@ -61,6 +61,11 @@ class Settings(BaseSettings):
         default="/v1/pay-user/inquiries",
         alias="NAVER_LIST_CONVERSATIONS_PATH",
     )
+    naver_inquiry_search_days: int = Field(default=30, alias="NAVER_INQUIRY_SEARCH_DAYS")
+    naver_order_detail_path: str = Field(
+        default="/v1/pay-order/seller/product-orders/query",
+        alias="NAVER_ORDER_DETAIL_PATH",
+    )
     naver_send_message_path: str = Field(
         default="/v1/pay-merchant/inquiries/{conversation_id}/answer",
         alias="NAVER_SEND_MESSAGE_PATH",

@@ -46,7 +46,14 @@ class ApiChannelClient(ChannelClient):
                 json=json,
                 params=params,
             )
-            response.raise_for_status()
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                response_text = exc.response.text[:1000]
+                raise ValueError(
+                    f"{exc.response.status_code} {exc.response.reason_phrase} for "
+                    f"{exc.request.method} {exc.request.url}; response={response_text}"
+                ) from exc
             if not response.content:
                 return {}
             return response.json()
