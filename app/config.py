@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     app_port: int = Field(default=8000, alias="APP_PORT")
     app_log_level: str = Field(default="INFO", alias="APP_LOG_LEVEL")
     sqlite_path: str = Field(default="./shopping_cs.sqlite3", alias="SQLITE_PATH")
+    audit_log_dir: str = Field(default="./logs/audit", alias="AUDIT_LOG_DIR")
 
     telegram_bot_token: str = Field(default="", alias="TELEGRAM_BOT_TOKEN")
     telegram_allowed_chat_ids: str = Field(default="", alias="TELEGRAM_ALLOWED_CHAT_IDS")

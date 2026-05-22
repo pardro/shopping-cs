@@ -2,30 +2,32 @@
 
 카카오톡 비즈니스센터와 스마트스토어 톡톡 문의를 통합 관리하는 대화형 쇼핑몰 CS 비서입니다.
 운영자는 Telegram에서 자연어로 요청하고, 메인 에이전트는 ChatGPT로 요청을 분석해 실행 계획을
-만든 뒤 승인받은 작업만 순차적으로 수행합니다.
+만든 뒤 조회/동기화/초안/상담 종료 작업은 바로 수행합니다. 고객에게 특정 메시지를 전송하는 작업만
+운영자 승인 후 수행합니다.
 
 ## 핵심 동작
 
 1. 운영자가 Telegram으로 자연어 요청을 보냅니다.
 2. 메인 에이전트가 요청을 분석해 실행 계획을 만듭니다.
 3. 각 계획은 실제 수행 가능한 API 작업 형태로 준비됩니다.
-4. 메인 에이전트가 계획, 이유, 준비된 API 작업, 주의 사항을 운영자에게 보여줍니다.
-5. 운영자가 `승인` 또는 `실행`이라고 답하면 계획을 순서대로 실행합니다.
-6. 운영자가 `취소`라고 답하면 대기 중인 계획을 폐기합니다.
+4. 고객에게 메시지를 전송하지 않는 작업은 즉시 실행합니다.
+5. 고객에게 특정 메시지를 전송하는 작업은 계획, 이유, 준비된 API 작업, 주의 사항을 운영자에게 보여줍니다.
+6. 운영자가 `승인` 또는 `실행`이라고 답하면 전송 작업을 수행합니다.
+7. 운영자가 `취소`라고 답하면 대기 중인 전송 계획을 폐기합니다.
 
-고객에게 메시지를 보내거나 상담을 종료하는 작업은 항상 승인 후 실행됩니다.
+고객에게 메시지를 보내는 작업만 항상 승인 후 실행됩니다.
 
 ## 서비스 구조
 
 - `app/main.py`: FastAPI 앱 진입점
 - `app/api.py`: 헬스 체크, 대화 요청 API, 채널 웹훅 API
 - `app/telegram_bot.py`: Telegram Bot API long polling 워커
-- `app/agents/main_agent.py`: 자연어 분석, 실행 계획 생성, 승인 대기, 순차 실행
+- `app/agents/main_agent.py`: 자연어 분석, 즉시 실행, 전송 승인 대기, 순차 실행
 - `app/agents/sub_agent.py`: 채널별 CS 처리 서브 에이전트
 - `app/channels/kakao.py`: 카카오톡 비즈니스센터 API 클라이언트
 - `app/channels/naver_talktalk.py`: 스마트스토어 톡톡 API 클라이언트
 - `app/llm.py`: OpenAI ChatGPT 호출 계층
-- `app/storage/repository.py`: SQLite 티켓, 승인 대기 계획, 대화 컨텍스트 저장소
+- `app/storage/repository.py`: SQLite 티켓, 전송 승인 대기 계획, 대화 컨텍스트 저장소
 
 ## 지원 작업
 
@@ -46,27 +48,6 @@
 
 ```text
 각 채널별로 미처리 문의 내역 정리해서 나열해 줘
-```
-
-메인 에이전트:
-
-```text
-요청을 분석했습니다.
-목표: 채널별 미처리 문의 목록 확인
-요약: 로컬에 저장된 open 문의를 채널별로 정리합니다.
-
-수행 계획:
-1. CS 현황 요약
-   이유: 각 채널별 미처리 문의를 나열하기 위해 필요합니다.
-   준비된 API 작업: 로컬 DB 미처리 문의 조회
-
-이대로 진행하려면 '승인' 또는 '실행'이라고 답장하세요. 취소하려면 '취소'라고 답장하세요.
-```
-
-운영자:
-
-```text
-승인
 ```
 
 메인 에이전트:
@@ -96,16 +77,33 @@ naver
 ```
 
 메인 에이전트는 직전에 보여준 번호표를 이용해 `카카오 1번`을 `kakao-test-001`로 해석하고,
-승인받은 뒤 답변 초안을 생성합니다.
+답변 초안을 바로 생성합니다.
 
 ## 실행 준비
 
 Python 3.11 이상을 사용합니다.
 
+macOS/Linux:
+
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -U pip
+python -m pip install -e .
 cp .env.example .env
-pip install -e .
 ```
+
+Windows PowerShell:
+
+```powershell
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -U pip
+python -m pip install -e .
+Copy-Item .env.example .env
+```
+
+가상환경은 운영체제마다 실행 파일 구조가 다르므로 저장소에 커밋하지 말고 각 환경에서 새로 만듭니다.
 
 `.env`에 API 키와 파라미터를 입력합니다. 모든 키는 프로젝트 최상단 `.env`에서만 관리합니다.
 
@@ -115,6 +113,7 @@ pip install -e .
 OPENAI_API_KEY=sk-...
 OPENAI_MODEL=gpt-4o-mini
 TELEGRAM_BOT_TOKEN=123456:telegram-bot-token
+AUDIT_LOG_DIR=./logs/audit
 ```
 
 채널 API까지 사용하려면 아래 값도 채워야 합니다.
@@ -156,6 +155,23 @@ curl http://localhost:8000/health
 python -m app.telegram_bot
 ```
 
+## API 설정 점검
+
+`.env`에 입력한 값으로 외부 API가 read-only 요청에 응답하는지 확인할 수 있습니다.
+민감한 토큰 값은 출력하지 않습니다.
+
+```bash
+python -m app.check_apis
+```
+
+이 명령은 OpenAI 모델 조회, Telegram `getMe`, Kakao/Naver 대화 목록 조회를 수행합니다.
+메시지 전송이나 상담 종료 같은 변경 작업은 실행하지 않습니다.
+
+## 감사 로그
+
+사용자 요청, 전송 승인 요청, 실행 성공/실패 내역은 `AUDIT_LOG_DIR` 폴더에 날짜별 JSONL 파일로 기록됩니다.
+기본 경로는 `./logs/audit/YYYY-MM-DD.jsonl`입니다. 날짜가 바뀌면 새 파일에 기록됩니다.
+
 ## Telegram 사용법
 
 Telegram에서 BotFather로 만든 봇에게 자연어로 요청합니다.
@@ -196,7 +212,7 @@ Telegram에서 BotFather로 만든 봇에게 자연어로 요청합니다.
 카카오 1번 상담 종료 처리해줘
 ```
 
-계획 승인:
+답변 전송 승인:
 
 ```text
 승인
@@ -213,7 +229,7 @@ Telegram에서 BotFather로 만든 봇에게 자연어로 요청합니다.
 Telegram 없이도 `/commands` API로 같은 흐름을 테스트할 수 있습니다. 같은 대화를 이어가려면
 동일한 `user_key`를 사용합니다.
 
-미처리 문의 목록 계획 생성:
+미처리 문의 목록 조회:
 
 ```bash
 curl -X POST http://localhost:8000/commands \
@@ -221,15 +237,7 @@ curl -X POST http://localhost:8000/commands \
   -d '{"user_key":"local-test","text":"각 채널별로 미처리 문의 내역 정리해서 나열해 줘"}'
 ```
 
-계획 승인:
-
-```bash
-curl -X POST http://localhost:8000/commands \
-  -H "Content-Type: application/json" \
-  -d '{"user_key":"local-test","text":"승인"}'
-```
-
-번호 참조로 초안 계획 생성:
+번호 참조로 초안 생성:
 
 ```bash
 curl -X POST http://localhost:8000/commands \
@@ -237,12 +245,16 @@ curl -X POST http://localhost:8000/commands \
   -d '{"user_key":"local-test","text":"카카오 1번 문의건에 대해서 오늘 출고 예정이라고 초안 만들어 줘"}'
 ```
 
-초안 생성 승인:
+답변 전송 요청 후 승인:
 
 ```bash
 curl -X POST http://localhost:8000/commands \
   -H "Content-Type: application/json" \
-  -d '{"user_key":"local-test","text":"실행"}'
+  -d '{"user_key":"local-test","text":"카카오 1번 고객에게 오늘 출고 예정이라고 보내줘"}'
+
+curl -X POST http://localhost:8000/commands \
+  -H "Content-Type: application/json" \
+  -d '{"user_key":"local-test","text":"승인"}'
 ```
 
 ## 채널 웹훅 테스트
@@ -281,9 +293,9 @@ curl -X POST http://localhost:8000/webhooks/naver/cs \
 1. API 서버를 실행합니다.
 2. Telegram 워커를 실행합니다.
 3. 운영자가 자연어로 원하는 CS 작업을 요청합니다.
-4. 메인 에이전트가 실행 계획과 준비된 API 작업을 제안합니다.
-5. 운영자가 계획을 검토하고 `승인`합니다.
-6. 메인 에이전트가 계획을 순서대로 실행합니다.
+4. 메인 에이전트가 고객 메시지 전송이 아닌 작업은 바로 실행합니다.
+5. 고객 메시지 전송 작업은 실행 계획과 준비된 API 작업을 제안합니다.
+6. 운영자가 전송 계획을 검토하고 `승인`합니다.
 7. 실행 결과를 Telegram으로 받습니다.
 8. 후속 요청에서 “카카오 1번”, “네이버 2번”처럼 직전 목록 번호를 참조할 수 있습니다.
 

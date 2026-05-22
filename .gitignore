@@ -3,8 +3,11 @@
 venv/
 __pycache__/
 *.py[cod]
+get-pip.py
+*.egg-info/
 .pytest_cache/
 .ruff_cache/
+logs/
 *.sqlite3
 *.db
 .DS_Store
