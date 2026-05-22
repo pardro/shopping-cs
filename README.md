@@ -19,6 +19,65 @@
 - 날짜가 바뀌면 새 감사 로그 파일 생성
 - `.gitignore`로 `.env`, 로그, DB, 가상환경 파일 제외
 
+## 전체 서비스 파이프라인
+
+```mermaid
+flowchart TD
+    U["운영자<br/>Telegram 또는 HTTP API"] --> IN["입력 수신<br/>telegram_bot.py / POST /commands"]
+    IN --> AUDIT1["요청 감사 로그 기록<br/>logs/audit/YYYY-MM-DD.jsonl"]
+    IN --> CTX["사용자 컨텍스트 조회<br/>번호표, 승인 대기, 현재 상담"]
+    CTX --> PLAN["메인 에이전트<br/>자연어 요청 분석 및 실행 계획 생성"]
+    PLAN --> OPT["프로세스 최적화<br/>필요 시 sync 선행<br/>맥락 변경 시 close_ticket 추가"]
+    OPT --> APPROVAL{"고객 메시지<br/>전송 작업인가?"}
+
+    APPROVAL -- "예: send_reply" --> WAIT["승인 대기 저장<br/>prepared_api, 사유, 주의사항 출력"]
+    WAIT --> OPAPPROVE{"운영자 승인?"}
+    OPAPPROVE -- "승인 / 실행" --> SEND["채널 서브 에이전트<br/>고객 답변 전송 API 호출"]
+    OPAPPROVE -- "취소" --> CANCEL["승인 대기 계획 삭제"]
+
+    APPROVAL -- "아니오" --> EXEC["즉시 실행"]
+    EXEC --> SYNC["sync<br/>Kakao/Naver 문의 동기화"]
+    EXEC --> DETAIL["conversation_detail<br/>이전 대화 전체 조회"]
+    EXEC --> ORDER["order_lookup<br/>주문 상세 API 조회 및 모바일 포맷 출력"]
+    EXEC --> DRAFT["draft_reply<br/>초안 전용 서브 에이전트"]
+    EXEC --> CLOSE["close_ticket<br/>상담 종료 API 또는 로컬 상태 정리"]
+    EXEC --> SUMMARY["summary<br/>미처리 문의 목록 및 번호표 출력"]
+
+    SYNC --> REPO["SQLite 저장소<br/>문의, 메시지, 상태 저장"]
+    DETAIL --> REPO
+    ORDER --> REPO
+    DRAFT --> REPO
+    CLOSE --> REPO
+    SUMMARY --> REPO
+    SEND --> REPO
+    CANCEL --> REPO
+
+    REPO --> AUDIT2["실행 성공/실패 감사 로그 기록"]
+    AUDIT2 --> OUT["결과 응답<br/>모바일 가독성 포맷"]
+    OUT --> U
+
+    KAKAO["Kakao API<br/>설정된 경우"] <--> SYNC
+    KAKAO <--> SEND
+    KAKAO <--> CLOSE
+    NAVER["Naver Commerce API<br/>문의/주문/답변"] <--> SYNC
+    NAVER <--> ORDER
+    NAVER <--> SEND
+    NAVER <--> CLOSE
+    OPENAI["OpenAI API"] <--> PLAN
+    OPENAI <--> DRAFT
+```
+
+파이프라인 핵심:
+
+- 입력 채널은 Telegram과 HTTP API 두 가지이며, 내부에서는 동일하게 `MainAgent.handle_message()` 흐름을 사용합니다.
+- 모든 사용자 요청과 실행 결과는 감사 로그에 남습니다.
+- 메인 에이전트는 실행 전에 번호표, 승인 대기 상태, 현재 상담 컨텍스트를 조회합니다.
+- 조회성 작업은 승인 없이 즉시 실행하고, 필요한 경우 최신 채널 동기화를 먼저 수행합니다.
+- 답변 초안은 별도 `DraftReplyAgent`가 이전 대화 전체를 기반으로 생성합니다.
+- 고객에게 실제 메시지를 보내는 `send_reply`만 승인 대기 상태로 저장됩니다.
+- 주문 조회는 문의 데이터에서 상품 주문번호를 찾고, Naver 주문 상세 API를 호출한 뒤 모바일 친화 포맷으로 출력합니다.
+- 실행 후 SQLite 저장소와 날짜별 감사 로그가 갱신되고, 결과가 Telegram 또는 HTTP 응답으로 반환됩니다.
+
 ## 동작 흐름
 
 1. 운영자가 Telegram 또는 HTTP API로 요청합니다.
