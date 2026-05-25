@@ -8,6 +8,7 @@ from app.agents.information_collector_agent import InformationCollectorAgent
 from app.agents.judgement_agent import JudgementAgent
 from app.agents.planning_agent import PlanningAgent
 from app.agents.sub_agent import ChannelCsAgent
+from app.agents.tool_calling_agent import ToolCallingAgent
 from app.audit import AuditLogger
 from app.llm import ChatGPTClient
 from app.models import (
@@ -41,6 +42,7 @@ class MainAgent:
         self._planning_agent = PlanningAgent(llm, self._planner_context_text)
         self._information_collector_agent = InformationCollectorAgent()
         self._judgement_agent = JudgementAgent(repository, llm)
+        self._tool_calling_agent = ToolCallingAgent(llm)
 
     async def handle_command(self, text: str, user_key: str = "default") -> CommandResult:
         return await self.handle_message(text, user_key=user_key)
@@ -98,196 +100,17 @@ class MainAgent:
             )
 
         try:
-            self._audit(
-                "planning_started",
-                {"agent": "PlanningAgent"},
-                process_log=process_log,
-            )
-            plan = await self._create_plan(normalized, user_key)
-            self._audit(
-                "plan_created",
-                {"agent": "PlanningAgent", "plan": plan.model_dump()},
-                process_log=process_log,
-            )
-            plan = self._prepare_plan(plan, user_key)
-            plan = self._optimize_plan_for_fresh_context(plan)
-            plan = self._append_contextual_close_if_needed(plan, user_key)
-            self._audit(
-                "plan_prepared",
-                {"plan": plan.model_dump()},
-                process_log=process_log,
-            )
+            result = await self._handle_with_tools(normalized, user_key, process_log)
         except Exception as exc:
             self._audit(
-                "planning_failed",
+                "tool_pipeline_failed",
                 {"error": str(exc)},
                 process_log=process_log,
             )
-            return self._finalize_turn(
-                CommandResult(ok=False, message=f"요청 분석 실패: {exc}"),
-                user_key=user_key,
-                user_text=text,
-                user_timestamp=user_timestamp,
-                process_log=process_log,
-            )
-
-        if plan.needs_more_info or not plan.actions:
-            question = plan.question or "수행에 필요한 정보가 부족합니다. 조금 더 구체적으로 말씀해주세요."
-            self._audit(
-                "plan_needs_more_info",
-                {"user_key": user_key, "question": question, "plan": plan.model_dump()},
-                process_log=process_log,
-            )
-            return self._finalize_turn(
-                CommandResult(ok=True, message=question, data={"plan": plan.model_dump()}),
-                user_key=user_key,
-                user_text=text,
-                user_timestamp=user_timestamp,
-                process_log=process_log,
-            )
-
-        messages: list[str] = []
-        results: list[str] = []
-        ok = True
-
-        collector = self._information_collector_agent
-        information_plan, execution_plan = collector.split_information_actions(plan)
-        if information_plan.actions:
-            self._audit(
-                "information_collection_started",
-                {
-                    "agent": "InformationCollectorAgent",
-                    "plan": information_plan.model_dump(),
-                },
-                process_log=process_log,
-            )
-            information_result = await self._execute_plan(
-                information_plan,
-                user_key,
-                process_log=process_log,
-            )
-            ok = information_result.ok
-            messages.append(information_result.message)
-            results.extend(information_result.data.get("results", []))
-            if not information_result.ok:
-                return self._finalize_turn(
-                    CommandResult(
-                        ok=False,
-                        message="\n\n".join(messages),
-                        data={"plan": plan.model_dump(), "results": results},
-                    ),
-                    user_key=user_key,
-                    user_text=text,
-                    user_timestamp=user_timestamp,
-                    process_log=process_log,
-                )
-
-        self._audit(
-            "judgement_started",
-            {"agent": "JudgementAgent", "plan": execution_plan.model_dump()},
-            process_log=process_log,
-        )
-        judged_plan_result = await self._judgement_agent.finalize_plan(execution_plan, user_key)
-        execution_plan = self._prepare_plan(judged_plan_result.plan, user_key)
-        if judged_plan_result.notes:
-            self._audit(
-                "plan_judged",
-                {
-                    "user_key": user_key,
-                    "notes": judged_plan_result.notes,
-                    "plan": execution_plan.model_dump(),
-                },
-                process_log=process_log,
-            )
-        if execution_plan.needs_more_info or not execution_plan.actions:
-            if execution_plan.needs_more_info:
-                question = execution_plan.question or "수행할 대상 문의를 판단하려면 정보가 더 필요합니다."
-                self._audit(
-                    "plan_needs_more_info",
-                    {
-                        "user_key": user_key,
-                        "question": question,
-                        "plan": execution_plan.model_dump(),
-                    },
-                    process_log=process_log,
-                )
-                messages.append(question)
-            elif not messages:
-                messages.append("수행할 작업이 없습니다.")
-            return self._finalize_turn(
-                CommandResult(
-                    ok=ok,
-                    message="\n\n".join(messages),
-                    data={
-                        "plan": plan.model_dump(),
-                        "execution_plan": execution_plan.model_dump(),
-                        "results": results,
-                        "judgement_notes": judged_plan_result.notes,
-                    },
-                ),
-                user_key=user_key,
-                user_text=text,
-                user_timestamp=user_timestamp,
-                process_log=process_log,
-            )
-
-        immediate_plan, approval_plan = self._split_plan_by_approval_requirement(execution_plan)
-
-        if immediate_plan.actions:
-            self._audit(
-                "execution_started",
-                {"plan": immediate_plan.model_dump()},
-                process_log=process_log,
-            )
-            execution_result = await self._execute_plan(
-                immediate_plan,
-                user_key,
-                process_log=process_log,
-            )
-            ok = execution_result.ok
-            messages.append(execution_result.message)
-            results.extend(execution_result.data.get("results", []))
-            if not execution_result.ok:
-                return self._finalize_turn(
-                    CommandResult(
-                        ok=False,
-                        message="\n\n".join(messages),
-                        data={
-                            "plan": plan.model_dump(),
-                            "execution_plan": execution_plan.model_dump(),
-                            "results": results,
-                            "judgement_notes": judged_plan_result.notes,
-                        },
-                    ),
-                    user_key=user_key,
-                    user_text=text,
-                    user_timestamp=user_timestamp,
-                    process_log=process_log,
-                )
-
-        if approval_plan.actions:
-            self._repository.save_pending_plan(user_key, approval_plan)
-            self._audit(
-                "send_reply_approval_requested",
-                {"user_key": user_key, "plan": approval_plan.model_dump()},
-                process_log=process_log,
-            )
-            messages.append(self._format_plan_for_approval(approval_plan))
-
-        if not messages:
-            messages.append("수행할 작업이 없습니다.")
+            result = CommandResult(ok=False, message=f"요청 처리 실패: {exc}")
 
         return self._finalize_turn(
-            CommandResult(
-                ok=ok,
-                message="\n\n".join(messages),
-                data={
-                    "plan": plan.model_dump(),
-                    "execution_plan": execution_plan.model_dump(),
-                    "results": results,
-                    "judgement_notes": judged_plan_result.notes,
-                },
-            ),
+            result,
             user_key=user_key,
             user_text=text,
             user_timestamp=user_timestamp,
@@ -302,21 +125,377 @@ class MainAgent:
                 "카카오랑 네이버 문의를 동기화하고 미처리 건 요약해줘",
                 "네이버 채널 문의건들만 최신화해서 보여줘",
                 "카카오 kakao-test-001 고객에게 보낼 답변 초안을 만들어줘",
-                "카카오 채널 문의건 전체에 배송지연 안내 답변 초안 작성해줘",
                 "지금 나열해준 배송지연 문의건들에 대해 연휴 배송지연 답변 초안 작성해줘",
-                "네이버 naver-test-001 고객에게 '확인 후 안내드리겠습니다'라고 보내줘",
+                "네이버 1번 고객에게 '확인 후 안내드리겠습니다'라고 보내줘",
                 "카카오 kakao-test-001 상담 종료 처리해줘",
                 "",
                 "흐름:",
-                "1. 분석/계획 에이전트가 요청을 해석하고 필요한 서브 에이전트를 고릅니다.",
-                "2. 필요하면 채널 최신화로 정보를 먼저 수집합니다.",
-                "3. 취합 및 판단 에이전트가 조건에 맞는 문의 대상을 확정합니다.",
-                "4. 조회, 동기화, 초안, 상담 종료는 바로 실행합니다.",
-                "5. 고객에게 특정 메시지를 전송하는 작업만 먼저 승인 요청을 드립니다.",
+                "1. LLM이 사용 가능한 CS 툴 명세를 기준으로 필요한 툴을 직접 선택합니다.",
+                "2. 최신 정보가 필요하면 동기화 툴을 먼저 호출합니다.",
+                "3. 번호표, 조건, 범위는 선택 툴과 조회 툴로 실제 문의 ID에 연결합니다.",
+                "4. 조회, 동기화, 주문조회, 초안, 상담 종료는 즉시 실행합니다.",
+                "5. 고객에게 특정 메시지를 전송하는 작업만 승인 대기 계획으로 저장합니다.",
                 "6. 전송 계획이 맞으면 '승인' 또는 '실행'이라고 답장하세요.",
                 "7. 취소하려면 '취소'라고 답장하세요.",
             ]
         )
+
+    async def _handle_with_tools(
+        self,
+        user_request: str,
+        user_key: str,
+        process_log: list[dict[str, Any]],
+    ) -> CommandResult:
+        self._audit(
+            "tool_pipeline_started",
+            {
+                "agent": "ToolCallingAgent",
+                "tools": self._tool_calling_agent.tool_names,
+            },
+            process_log=process_log,
+        )
+
+        async def executor(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            return await self._execute_cs_tool(name, arguments, user_key, process_log)
+
+        message, trace = await self._tool_calling_agent.handle(
+            user_request=user_request,
+            user_key=user_key,
+            context_text=self._tool_context_text(user_key),
+            tool_executor=executor,
+        )
+        self._audit(
+            "tool_pipeline_completed",
+            {"tool_call_count": len(trace), "trace": trace},
+            process_log=process_log,
+        )
+        return CommandResult(
+            ok=not any(not item.get("result", {}).get("ok", True) for item in trace),
+            message=message.strip() or "수행할 작업이 없습니다.",
+            data={"tool_trace": trace},
+        )
+
+    def _tool_context_text(self, user_key: str) -> str:
+        pending_plan = self._repository.get_pending_plan(user_key)
+        pending_text = "없음"
+        if pending_plan:
+            pending_text = self._format_plan_for_approval(pending_plan)
+        active = self._active_conversation(user_key)
+        active_text = "없음"
+        if active:
+            active_text = f"{active[0].value} #{active[1]}"
+        return "\n".join(
+            [
+                "현재 날짜/시간:",
+                datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z"),
+                "",
+                "현재 CS 상태:",
+                self._summary_text(),
+                "",
+                "직전에 사용자에게 보여준 문의 번호표:",
+                self._last_ticket_mapping_text(user_key),
+                "",
+                "현재 상담 컨텍스트:",
+                active_text,
+                "",
+                "승인 대기 계획:",
+                pending_text,
+            ]
+        )
+
+    async def _execute_cs_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        user_key: str,
+        process_log: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        arguments = arguments if isinstance(arguments, dict) else {}
+        try:
+            if name == "sync_conversations":
+                result = await self._tool_sync_conversations(arguments, user_key)
+            elif name == "summarize_open_tickets":
+                result = self._tool_summarize_open_tickets(arguments, user_key)
+            elif name == "select_conversations":
+                result = self._tool_select_conversations(arguments, user_key)
+            elif name == "get_conversation_detail":
+                result = await self._tool_conversation_action(
+                    ActionType.CONVERSATION_DETAIL,
+                    arguments,
+                    user_key,
+                )
+            elif name == "lookup_order":
+                result = await self._tool_conversation_action(
+                    ActionType.ORDER_LOOKUP,
+                    arguments,
+                    user_key,
+                )
+            elif name == "draft_reply":
+                result = await self._tool_conversation_action(
+                    ActionType.DRAFT_REPLY,
+                    arguments,
+                    user_key,
+                )
+            elif name == "prepare_send_replies":
+                result = self._tool_prepare_send_replies(arguments, user_key)
+            elif name == "close_ticket":
+                result = await self._tool_conversation_action(
+                    ActionType.CLOSE_TICKET,
+                    arguments,
+                    user_key,
+                )
+            else:
+                result = self._tool_result(False, f"지원하지 않는 툴입니다: {name}")
+        except Exception as exc:
+            result = self._tool_result(False, str(exc))
+
+        self._audit(
+            "tool_called",
+            {"tool": name, "arguments": arguments, "result": result},
+            process_log=process_log,
+        )
+        return result
+
+    async def _tool_sync_conversations(
+        self,
+        arguments: dict[str, Any],
+        user_key: str,
+    ) -> dict[str, Any]:
+        channel = self._channel_from_tool(arguments.get("channel"))
+        action = PlannedAction(
+            type=ActionType.SYNC,
+            channel=channel,
+            reason="LLM tool-call requested fresh channel data.",
+        )
+        result = await self._execute_action(action, user_key)
+        ok = "동기화 실패" not in result and bool(result.strip())
+        return self._tool_result(
+            ok,
+            result or "동기화된 채널이 없습니다.",
+            {"channel": channel.value if channel else "all"},
+        )
+
+    def _tool_summarize_open_tickets(
+        self,
+        arguments: dict[str, Any],
+        user_key: str,
+    ) -> dict[str, Any]:
+        channel = self._channel_from_tool(arguments.get("channel"))
+        result = self._summary_text(user_key=user_key, channel=channel)
+        return self._tool_result(True, result, {"channel": channel.value if channel else "all"})
+
+    async def _tool_conversation_action(
+        self,
+        action_type: ActionType,
+        arguments: dict[str, Any],
+        user_key: str,
+    ) -> dict[str, Any]:
+        channel = self._channel_from_tool(arguments.get("channel"), allow_all=False)
+        if channel is None:
+            raise ValueError("channel is required")
+        conversation_id = self._resolve_tool_conversation_id(
+            channel,
+            str(arguments.get("conversation_id") or ""),
+            user_key,
+        )
+        action = PlannedAction(
+            type=action_type,
+            channel=channel,
+            conversation_id=conversation_id,
+            message=arguments.get("guidance"),
+            reason="LLM tool-call requested this CS operation.",
+        )
+        result = await self._execute_action(action, user_key)
+        return self._tool_result(
+            True,
+            result,
+            {"channel": channel.value, "conversation_id": conversation_id},
+        )
+
+    def _tool_select_conversations(
+        self,
+        arguments: dict[str, Any],
+        user_key: str,
+    ) -> dict[str, Any]:
+        scope = TargetScope(str(arguments.get("scope") or TargetScope.LAST_LISTED.value))
+        channel = self._channel_from_tool(arguments.get("channel"))
+        target_filter = str(arguments.get("target_filter") or "").strip()
+        limit = int(arguments.get("limit") or 20)
+        candidates = self._tool_candidate_conversations(scope, channel, user_key)
+        selected = candidates
+        if target_filter:
+            selected = self._judgement_agent._fallback_select(target_filter, candidates)
+        selected = selected[: max(1, min(limit, 50))]
+        payload = [self._conversation_brief(conversation) for conversation in selected]
+        if not payload:
+            return self._tool_result(
+                True,
+                "조건에 맞는 문의를 찾지 못했습니다.",
+                {"selected": [], "target_filter": target_filter, "scope": scope.value},
+            )
+        lines = ["선택된 문의:"]
+        lines.extend(
+            f"- {item['channel']} #{item['conversation_id']} {item['customer_name']} "
+            f"{item['latest_message']}".rstrip()
+            for item in payload
+        )
+        return self._tool_result(
+            True,
+            "\n".join(lines),
+            {"selected": payload, "target_filter": target_filter, "scope": scope.value},
+        )
+
+    def _tool_prepare_send_replies(
+        self,
+        arguments: dict[str, Any],
+        user_key: str,
+    ) -> dict[str, Any]:
+        replies = arguments.get("replies") or []
+        if not isinstance(replies, list) or not replies:
+            raise ValueError("replies must include at least one message")
+        actions: list[PlannedAction] = []
+        for reply in replies:
+            if not isinstance(reply, dict):
+                continue
+            channel = self._channel_from_tool(reply.get("channel"), allow_all=False)
+            if channel is None:
+                raise ValueError("reply channel is required")
+            conversation_id = self._resolve_tool_conversation_id(
+                channel,
+                str(reply.get("conversation_id") or ""),
+                user_key,
+            )
+            message = str(reply.get("message") or "").strip()
+            if not message:
+                raise ValueError("reply message is required")
+            action = PlannedAction(
+                type=ActionType.SEND_REPLY,
+                channel=channel,
+                conversation_id=conversation_id,
+                message=message,
+                reason=str(arguments.get("reason") or "고객 답변 전송 요청"),
+            )
+            action.prepared_api = self._prepared_api_text(action)
+            actions.append(action)
+        if not actions:
+            raise ValueError("no valid replies were provided")
+
+        existing = self._repository.get_pending_plan(user_key)
+        raw_risk_notes = arguments.get("risk_notes") or []
+        if isinstance(raw_risk_notes, str):
+            risk_notes = [raw_risk_notes]
+        else:
+            risk_notes = [str(note) for note in raw_risk_notes]
+        if existing and existing.actions:
+            plan = existing.model_copy(
+                update={
+                    "actions": [*existing.actions, *actions],
+                    "risk_notes": [*existing.risk_notes, *risk_notes],
+                }
+            )
+        else:
+            plan = ExecutionPlan(
+                user_goal="고객 답변 전송 승인 대기",
+                summary=f"{len(actions)}건의 고객 답변 전송을 승인 대기 상태로 저장합니다.",
+                actions=actions,
+                risk_notes=risk_notes,
+            )
+        self._repository.save_pending_plan(user_key, plan)
+        approval_text = self._format_plan_for_approval(plan)
+        return self._tool_result(
+            True,
+            approval_text,
+            {"pending_actions": [action.model_dump() for action in plan.actions]},
+        )
+
+    def _tool_candidate_conversations(
+        self,
+        scope: TargetScope,
+        channel: ChannelName | None,
+        user_key: str,
+    ) -> list:
+        if scope == TargetScope.LAST_LISTED:
+            context = self._repository.get_user_context(user_key)
+            mapping = context.get("last_open_ticket_mapping", {})
+            if not isinstance(mapping, dict):
+                return []
+            conversations = []
+            for channel_value, indexed_ids in mapping.items():
+                if channel and channel_value != channel.value:
+                    continue
+                try:
+                    current_channel = ChannelName(channel_value)
+                except ValueError:
+                    continue
+                if not isinstance(indexed_ids, dict):
+                    continue
+                for conversation_id in indexed_ids.values():
+                    conversation = self._repository.get_conversation(
+                        current_channel,
+                        str(conversation_id),
+                    )
+                    if conversation:
+                        conversations.append(conversation)
+            return conversations
+        if scope == TargetScope.CHANNEL_OPEN:
+            return self._repository.list_conversations(
+                channel=channel,
+                status=TicketStatus.OPEN,
+                limit=100,
+            )
+        return self._repository.list_conversations(status=TicketStatus.OPEN, limit=100)
+
+    @staticmethod
+    def _conversation_brief(conversation) -> dict[str, str]:
+        latest_message = ""
+        if conversation.messages:
+            latest_message = conversation.messages[-1].text[:160]
+        return {
+            "channel": conversation.channel.value,
+            "conversation_id": conversation.conversation_id,
+            "customer_name": conversation.customer_name or "",
+            "latest_message": latest_message,
+            "status": conversation.status.value,
+        }
+
+    def _resolve_tool_conversation_id(
+        self,
+        channel: ChannelName,
+        conversation_id: str,
+        user_key: str,
+    ) -> str:
+        if not conversation_id.strip():
+            raise ValueError("conversation_id is required")
+        action = PlannedAction(
+            type=ActionType.CONVERSATION_DETAIL,
+            channel=channel,
+            conversation_id=conversation_id,
+            reason="툴 입력 번호표 해석",
+        )
+        resolved = self._resolve_numbered_reference(action, user_key)
+        return self._normalize_conversation_id(resolved or conversation_id)
+
+    @staticmethod
+    def _channel_from_tool(value: Any, allow_all: bool = True) -> ChannelName | None:
+        text = str(value or "all").strip().lower()
+        aliases = {
+            "카카오": ChannelName.KAKAO.value,
+            "kakao": ChannelName.KAKAO.value,
+            "네이버": ChannelName.NAVER.value,
+            "naver": ChannelName.NAVER.value,
+        }
+        if allow_all and text in {"", "all", "전체", "both", "kakao/naver"}:
+            return None
+        text = aliases.get(text, text)
+        return ChannelName(text)
+
+    @staticmethod
+    def _tool_result(
+        ok: bool,
+        content: str,
+        data: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return {"ok": ok, "content": content, "data": data or {}}
 
     async def _create_plan(self, user_request: str, user_key: str) -> ExecutionPlan:
         return await self._planning_agent.create_plan(user_request, user_key)

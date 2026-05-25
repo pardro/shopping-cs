@@ -2,23 +2,23 @@
 
 카카오톡 비즈니스 채널, 네이버 스마트스토어 고객 문의, Telegram 운영자 채팅을 묶어 관리하는 CS 보조 에이전트입니다.
 
-운영자는 Telegram 또는 HTTP API로 자연어 요청을 보내고, 메인 에이전트가 필요한 API 호출 계획을 만든 뒤 실행합니다. 고객에게 실제 답변을 보내는 작업만 운영자 승인을 요구하며, 조회/동기화/초안 생성/주문 조회 같은 작업은 바로 실행됩니다.
+운영자는 Telegram 또는 HTTP API로 자연어 요청을 보내고, LLM tool-call 에이전트가 필요한 CS 툴을 직접 선택해 실행합니다. 고객에게 실제 답변을 보내는 작업만 운영자 승인을 요구하며, 조회/동기화/초안 생성/주문 조회 같은 작업은 바로 실행됩니다.
 
 ## 주요 기능
 
 - macOS, Linux, Windows PowerShell에서 실행 가능
 - Telegram Bot long polling 지원
 - HTTP `/commands` API로 로컬 테스트 가능
-- 분석/계획 서브 에이전트가 자연어 요청을 실행 계획과 대상 선택 조건으로 변환
-- 정보 수집 서브 에이전트가 필요한 채널 최신화 단계를 선행 배치
-- 취합 및 판단 서브 에이전트가 직전 목록/채널 전체/조건부 문의 대상을 확정
-- 채널별 서브 에이전트가 동기화, 답변 초안, 전송, 상담 종료 처리
+- OpenAI tool-call 기능으로 자연어 요청에 필요한 CS 툴을 직접 선택
+- `CS_TOOL_SPECS`에 사용 가능한 툴 명세를 단일 출처로 정리
+- 툴 실행부가 직전 목록/채널 전체/조건부 문의 대상을 실제 문의 ID로 확정
+- 채널별 실행 로직이 동기화, 답변 초안, 전송, 상담 종료 처리
 - 답변 초안 전용 서브 에이전트가 이전 대화 전체를 기반으로 초안 생성
 - 다건 문의에 대한 조건부 답변 초안 생성 지원
 - 문의 상세 또는 초안 요청 시 해당 문의의 이전 대화 기록 전체 출력
 - 주문내역 조회 시 고객 주문 내역, 옵션, 수량, 주문번호, 주문 상태 출력
 - 고객에게 특정 메시지를 보내는 `send_reply` 작업만 승인 필요
-- 사용자의 요청, 실행 계획, 실행 결과를 날짜별 사용자 대화 JSON 로그로 저장
+- 사용자의 요청, 툴 호출 trace, 실행 결과를 날짜별 사용자 대화 JSON 로그로 저장
 - 날짜가 바뀌면 새 대화 로그 파일 생성
 - `.gitignore`로 `.env`, 로그, DB, 가상환경 파일 제외
 
@@ -27,40 +27,36 @@
 ```mermaid
 flowchart TD
     U["운영자<br/>Telegram 또는 HTTP API"] --> IN["입력 수신<br/>telegram_bot.py / POST /commands"]
-    IN --> AUDIT1["요청 대화 로그 준비<br/>logs/audit/YYYY-MM-DD_user-key.json"]
-    IN --> CTX["사용자 컨텍스트 조회<br/>번호표, 승인 대기, 현재 상담"]
-    CTX --> PLAN["분석/계획 서브 에이전트<br/>요청 분석, 대상 범위/필터 설정<br/>사용할 서브 에이전트 계획"]
-    PLAN --> INFO{"정보 수집 필요?"}
-    INFO -- "예" --> COLLECT["정보 수집 서브 에이전트<br/>Kakao/Naver 최신 문의 동기화"]
-    INFO -- "아니오" --> ROUTE["실행 후보 액션 정리"]
-    COLLECT --> REPO["SQLite 저장소<br/>문의, 메시지, 상태 저장"]
-    REPO --> ROUTE
-    ROUTE --> JUDGE["취합 및 판단 서브 에이전트<br/>직전 목록/채널 전체/조건부 후보 판단<br/>구체 대화 ID로 실행 계획 확정"]
-    JUDGE --> APPROVAL{"고객 메시지<br/>전송 작업인가?"}
+    IN --> AUDIT1["요청 대화 로그 시작<br/>logs/audit/YYYY-MM-DD_user-key.json"]
+    IN --> CTX["툴 컨텍스트 구성<br/>CS 현황, 직전 번호표, 현재 상담, 승인 대기 계획"]
+    CTX --> LLM["LLM Tool-calling Agent<br/>사용자 요청 분석 및 필요한 툴 직접 선택"]
 
-    APPROVAL -- "예: send_reply" --> WAIT["승인 대기 저장<br/>prepared_api, 사유, 주의사항 출력"]
-    WAIT --> OPAPPROVE{"운영자 승인?"}
-    OPAPPROVE -- "승인 / 실행" --> SEND["채널 서브 에이전트<br/>고객 답변 전송 API 호출"]
-    OPAPPROVE -- "취소" --> CANCEL["승인 대기 계획 삭제"]
+    LLM --> SYNC["sync_conversations<br/>Kakao/Naver 문의 동기화"]
+    LLM --> SUMMARY["summarize_open_tickets<br/>미처리 문의 현황 및 번호표"]
+    LLM --> SELECT["select_conversations<br/>직전 목록/채널/전체 범위 대상 선택"]
+    LLM --> DETAIL["get_conversation_detail<br/>이전 대화 전체 조회"]
+    LLM --> ORDER["lookup_order<br/>주문 상세 조회"]
+    LLM --> DRAFT["draft_reply<br/>답변 초안 생성"]
+    LLM --> PREPARE["prepare_send_replies<br/>전송 승인 대기 계획 저장"]
+    LLM --> CLOSE["close_ticket<br/>상담 종료 처리"]
 
-    APPROVAL -- "아니오" --> EXEC["즉시 실행"]
-    EXEC --> SYNC["sync<br/>Kakao/Naver 문의 동기화"]
-    EXEC --> DETAIL["conversation_detail<br/>채널 서브 에이전트가 이전 대화 조회"]
-    EXEC --> ORDER["order_lookup<br/>채널 서브 에이전트가 주문 상세 API 조회"]
-    EXEC --> DRAFT["draft_reply<br/>답변 초안 서브 에이전트"]
-    EXEC --> CLOSE["close_ticket<br/>상담 종료 API 또는 로컬 상태 정리"]
-    EXEC --> SUMMARY["summary<br/>전체 또는 채널별 미처리 문의 목록 출력"]
-
-    SYNC --> REPO
+    SYNC --> REPO["SQLite 저장소<br/>문의, 메시지, 상태, 사용자 컨텍스트"]
+    SUMMARY --> REPO
+    SELECT --> REPO
     DETAIL --> REPO
     ORDER --> REPO
     DRAFT --> REPO
+    PREPARE --> REPO
     CLOSE --> REPO
-    SUMMARY --> REPO
+
+    PREPARE --> APPROVAL{"운영자 승인?"}
+    APPROVAL -- "승인 / 실행" --> SEND["기존 승인 플로우<br/>send_reply 실행"]
+    APPROVAL -- "취소" --> CANCEL["승인 대기 계획 삭제"]
     SEND --> REPO
     CANCEL --> REPO
 
-    REPO --> AUDIT2["턴별 대화 로그 기록<br/>user/chatbot/action"]
+    REPO --> LLM
+    LLM --> AUDIT2["턴별 tool trace 및 최종 응답 기록"]
     AUDIT2 --> OUT["결과 응답<br/>모바일 가독성 포맷"]
     OUT --> U
 
@@ -71,22 +67,40 @@ flowchart TD
     NAVER <--> ORDER
     NAVER <--> SEND
     NAVER <--> CLOSE
-    OPENAI["OpenAI API"] <--> PLAN
-    OPENAI <--> JUDGE
+    OPENAI["OpenAI API<br/>tool_calls"] <--> LLM
     OPENAI <--> DRAFT
 ```
 
 파이프라인 핵심:
 
 - 입력 채널은 Telegram과 HTTP API 두 가지이며, 내부에서는 동일하게 `MainAgent.handle_message()` 흐름을 사용합니다.
-- 모든 사용자 요청과 최종 응답, 응답 생성을 위한 내부 프로세스는 대화 로그에 남습니다.
-- 분석/계획 서브 에이전트는 번호표, 승인 대기 상태, 현재 상담 컨텍스트를 참고해 필요한 서브 에이전트와 대상 범위를 계획합니다.
-- 정보 수집 서브 에이전트는 조회/선택/초안 생성 전에 필요한 채널 동기화를 먼저 수행하도록 계획을 보강합니다.
-- 취합 및 판단 서브 에이전트는 `지금 나열해준 문의`, `네이버 채널 문의`, `3mm S/L 구매건` 같은 범위/조건을 실제 대화 ID 목록으로 확정합니다.
-- 답변 초안은 별도 `DraftReplyAgent`가 이전 대화 전체를 기반으로 생성합니다.
-- 고객에게 실제 메시지를 보내는 `send_reply`만 승인 대기 상태로 저장됩니다.
-- 주문 조회는 문의 데이터에서 상품 주문번호를 찾고, Naver 주문 상세 API를 호출한 뒤 모바일 친화 포맷으로 출력합니다.
-- 실행 후 SQLite 저장소와 날짜별 대화 로그가 갱신되고, 결과가 Telegram 또는 HTTP 응답으로 반환됩니다.
+- 기존의 `PlanningAgent -> InformationCollectorAgent -> JudgementAgent` 순차 통신 대신, `ToolCallingAgent`가 OpenAI tool-call 기능으로 필요한 툴을 직접 선택합니다.
+- 툴 명세는 `app/agents/tool_calling_agent.py`의 `CS_TOOL_SPECS`에 단일 출처로 정의되어 있으며, 같은 명세가 LLM 프롬프트에도 전달됩니다.
+- LLM은 최신성이 필요한 요청에서 `sync_conversations`를 먼저 호출하고, 조회/선택/주문조회/초안/승인대기 저장에 필요한 툴을 이어서 호출합니다.
+- `네이버 1번` 같은 번호표 참조는 툴 실행부에서 사용자별 `last_open_ticket_mapping`을 이용해 실제 `conversation_id`로 해석합니다.
+- `지금 나열해준 문의`, `네이버 채널 미처리 전체`, `전체 미처리 중 3mm S/L 구매건` 같은 다건 요청은 `select_conversations` 결과를 바탕으로 후속 툴을 반복 호출합니다.
+- 고객에게 실제 답변을 보내는 요청은 `prepare_send_replies`로 승인 대기 계획만 저장합니다. 실제 `send_reply` 실행은 운영자가 `승인` 또는 `실행`이라고 답한 뒤 기존 승인 플로우에서만 수행됩니다.
+- 모든 툴 호출 결과와 최종 응답은 날짜별 대화 로그에 `tool_trace`와 함께 남습니다.
+
+## Tool-call 툴 명세
+
+| 툴 | 목적 | 주요 인자 | 실행 성격 |
+| --- | --- | --- | --- |
+| `sync_conversations` | Kakao/Naver 문의 목록을 외부 API에서 동기화 | `channel` | 즉시 실행 |
+| `summarize_open_tickets` | 미처리 문의 현황과 번호표 조회 | `channel` | 즉시 실행 |
+| `select_conversations` | 직전 목록/채널/전체 범위에서 조건부 대상 선택 | `scope`, `channel`, `target_filter`, `limit` | 즉시 실행 |
+| `get_conversation_detail` | 특정 문의의 이전 대화 전체 조회 | `channel`, `conversation_id` | 즉시 실행 |
+| `lookup_order` | 문의에 연결된 주문 상세, 옵션, 수량, 주문번호, 상태 조회 | `channel`, `conversation_id` | 즉시 실행 |
+| `draft_reply` | 이전 대화 기반 고객 답변 초안 생성 | `channel`, `conversation_id`, `guidance` | 즉시 실행 |
+| `prepare_send_replies` | 고객 메시지 전송 계획을 승인 대기로 저장 | `replies`, `reason`, `risk_notes` | 승인 필요 |
+| `close_ticket` | 특정 문의 상담 종료 처리 | `channel`, `conversation_id` | 즉시 실행 |
+
+툴 사용 원칙:
+
+- LLM은 현재 데이터, 대화 기록, 주문 정보, 초안 생성, 승인 대기 저장, 상태 변경이 필요한 경우 툴을 우선 사용합니다.
+- 최신 데이터가 중요한 요청은 조회나 초안 생성 전에 `sync_conversations`를 먼저 호출합니다.
+- 번호표 값은 그대로 툴에 전달할 수 있으며, 실행부가 사용자 컨텍스트로 실제 문의 ID를 해석합니다.
+- 고객 발송 요청은 `prepare_send_replies`까지만 수행하고, 실제 발송은 승인 턴에서만 수행합니다.
 
 가능한 요청 예시:
 
@@ -98,14 +112,14 @@ flowchart TD
 ## 동작 흐름
 
 1. 운영자가 Telegram 또는 HTTP API로 요청합니다.
-2. 분석/계획 서브 에이전트가 요청을 분석해 실행 계획, 대상 범위, 대상 필터를 만듭니다.
-3. 정보 수집 서브 에이전트가 최신 데이터가 필요한 작업 앞에 채널 동기화를 배치합니다.
-4. 취합 및 판단 서브 에이전트가 조건에 맞는 문의를 실제 대화 ID로 확정합니다.
-5. 고객에게 메시지를 보내지 않는 작업은 즉시 실행됩니다.
-6. 고객에게 특정 답변을 보내는 작업은 실행 계획, 사유, 호출 예정 API를 보여준 뒤 승인 대기합니다.
-7. 운영자가 `승인` 또는 `실행`이라고 답하면 고객 메시지를 전송합니다.
-8. 운영자가 `취소`라고 답하면 승인 대기 중인 계획을 버립니다.
-9. 직전 상담과 다른 맥락의 요청이면 현재 상담 종료 API를 자동으로 호출하도록 계획을 보강합니다.
+2. `MainAgent`가 현재 CS 현황, 직전 번호표, 활성 상담, 승인 대기 계획을 모아 tool-call 컨텍스트를 만듭니다.
+3. `ToolCallingAgent`가 OpenAI tool-call 기능으로 필요한 툴을 선택합니다.
+4. 최신성이 필요하면 `sync_conversations`로 채널 데이터를 먼저 동기화합니다.
+5. 범위/조건이 있는 요청은 `select_conversations`로 실제 문의 대상을 확정합니다.
+6. 조회, 주문조회, 초안 생성, 상담 종료는 해당 툴로 즉시 실행합니다.
+7. 고객에게 메시지를 보내는 요청은 `prepare_send_replies`로 승인 대기 계획을 저장합니다.
+8. 운영자가 `승인` 또는 `실행`이라고 답하면 저장된 `send_reply` 계획을 실행합니다.
+9. 운영자가 `취소`라고 답하면 승인 대기 중인 계획을 버립니다.
 
 상담 종료 API는 채널별 종료 path가 설정된 경우에만 실제 외부 API를 호출합니다. path가 비어 있으면 로컬 상태만 정리하거나 skip 결과를 반환합니다.
 
@@ -115,9 +129,10 @@ flowchart TD
 - `app/api.py`: 헬스 체크, 명령 API, 채널 웹훅 API
 - `app/telegram_bot.py`: Telegram Bot API long polling 워커
 - `app/agents/main_agent.py`: 전체 파이프라인 오케스트레이션, 승인 플로우, 주문 조회 포맷
-- `app/agents/planning_agent.py`: 자연어 요청 분석, 대상 범위/필터 및 서브 에이전트 계획
-- `app/agents/information_collector_agent.py`: 최신 정보 수집을 위한 채널 동기화 단계 보강
-- `app/agents/judgement_agent.py`: 조건부/다건 문의 후보 취합 및 실행 대상 판단
+- `app/agents/tool_calling_agent.py`: OpenAI tool-call 기반 툴 명세와 실행 루프
+- `app/agents/planning_agent.py`: 이전 계획 기반 파이프라인용 자연어 요청 분석 모듈
+- `app/agents/information_collector_agent.py`: 이전 계획 기반 파이프라인용 최신화 단계 보강 모듈
+- `app/agents/judgement_agent.py`: 조건부/다건 문의 후보 선택 보조 로직
 - `app/agents/sub_agent.py`: 채널별 CS 처리 공통 서브 에이전트
 - `app/agents/draft_reply_agent.py`: 답변 초안 생성 전용 서브 에이전트
 - `app/channels/kakao.py`: Kakao 채널 API 클라이언트
@@ -136,7 +151,7 @@ flowchart TD
 - `send_reply`: 고객에게 답변 전송, 반드시 운영자 승인 필요
 - `close_ticket`: 상담 종료 처리
 
-`draft_reply`, `send_reply`, `conversation_detail`, `order_lookup`, `close_ticket`은 단일 `conversation_id`뿐 아니라 `target_scope`와 `target_filter`를 통해 다건 대상을 지정할 수 있습니다.
+다건 또는 조건부 대상은 `select_conversations` 툴에서 아래 범위로 먼저 고른 뒤, 선택된 `conversation_id`를 후속 툴에 전달합니다.
 
 - `last_listed`: 직전에 사용자에게 보여준 문의 목록에서 선택
 - `channel_open`: 특정 채널의 미처리 문의 전체에서 선택

@@ -2,7 +2,7 @@ from typing import Any
 
 from app.agents.draft_reply_agent import DraftReplyAgent
 from app.channels.base import ChannelClient
-from app.models import ChannelName, Conversation, DraftReply, TicketStatus
+from app.models import Conversation, DraftReply, TicketStatus
 from app.storage import CsRepository
 
 

@@ -4,6 +4,7 @@ from app.agents.judgement_agent import JudgementAgent
 from app.agents.main_agent import MainAgent
 from app.agents.planning_agent import PlanningAgent
 from app.agents.sub_agent import ChannelCsAgent
+from app.agents.tool_calling_agent import ToolCallingAgent
 
 __all__ = [
     "DraftReplyAgent",
@@ -12,4 +13,5 @@ __all__ = [
     "MainAgent",
     "PlanningAgent",
     "ChannelCsAgent",
+    "ToolCallingAgent",
 ]
